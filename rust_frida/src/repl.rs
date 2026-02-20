@@ -83,37 +83,15 @@ impl JsReplCompleter {
         }
     }
 
-    /// Send a jscomplete request and block until the agent replies (≤2000 ms timeout).
+    /// 向 agent 发送 jscomplete 请求，持锁等待响应（≤2000 ms），避免竞态。
     fn fetch_completions(&self, prefix: &str) -> Vec<String> {
-        let (lock, cvar) = complete_state();
-
-        // 持有锁的同时 clear + send + wait，避免竞态
-        let mut guard = match lock.lock() {
-            Ok(g) => g,
-            Err(_) => return vec![],
-        };
-        *guard = None;
-
-        // Send the request
-        let cmd = format!("jscomplete {}", prefix);
-        if self.sender.send(cmd).is_err() {
-            return vec![];
-        }
-
-        // Wait for the response (up to 2000 ms)
-        // wait_timeout 会原子释放锁并等待，被唤醒后重新获取锁
         let timeout = std::time::Duration::from_millis(2000);
-        let result = cvar.wait_timeout_while(guard, timeout, |val| val.is_none());
-        match result {
-            Ok((guard, timeout_result)) => {
-                if timeout_result.timed_out() {
-                    vec![]
-                } else {
-                    guard.clone().unwrap_or_default()
-                }
-            },
-            Err(_) => vec![],
-        }
+        let cmd = format!("jscomplete {}", prefix);
+        let sender = self.sender.clone();
+        // 持锁 clear + 发命令 + wait，原子消除竞态窗口
+        complete_state()
+            .clear_then_recv(timeout, || { let _ = sender.send(cmd); })
+            .unwrap_or_default()
     }
 }
 
@@ -268,45 +246,21 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
                     break;
                 }
                 // 发送前清空 eval 状态
-                {
-                    let (lock, _) = eval_state();
-                    if let Ok(mut guard) = lock.lock() {
-                        *guard = None;
-                    }
-                }
-                let cmd = format!("jseval {}", line);
+                eval_state().clear();
+                let cmd = format!("loadjs {}", line);
                 if let Err(e) = sender.send(cmd) {
                     log_error!("发送 JS 命令失败: {}", e);
                     break;
                 }
                 // 同步等待 agent 返回结果（最长 5 秒）
-                let (lock, cvar) = eval_state();
-                let timeout = std::time::Duration::from_secs(5);
-                let result = {
-                    let guard = match lock.lock() {
-                        Ok(g) => g,
-                        Err(_) => continue,
-                    };
-                    cvar.wait_timeout_while(guard, timeout, |val| val.is_none())
-                };
-                match result {
-                    Ok((guard, timeout_result)) => {
-                        if timeout_result.timed_out() {
-                            println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m");
-                        } else if let Some(eval_result) = guard.as_ref() {
-                            match eval_result {
-                                Ok(output) => {
-                                    if !output.is_empty() {
-                                        println!("\x1b[32m=> {}\x1b[0m", output);
-                                    }
-                                },
-                                Err(err) => {
-                                    println!("\x1b[31m[JS error] {}\x1b[0m", err);
-                                }
-                            }
+                match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
+                    None => println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m"),
+                    Some(Ok(output)) => {
+                        if !output.is_empty() {
+                            println!("\x1b[32m=> {}\x1b[0m", output);
                         }
                     },
-                    Err(_) => {},
+                    Some(Err(err)) => println!("\x1b[31m[JS error] {}\x1b[0m", err),
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {

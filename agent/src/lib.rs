@@ -735,33 +735,14 @@ fn process_cmd(command: &str) {
             }
         },
         #[cfg(feature = "quickjs")]
-        Some("loadjs") => {
-            // Extract the script (everything after "loadjs ")
-            let script = command.strip_prefix("loadjs").unwrap_or("").trim().to_string();
-            if script.is_empty() {
-                log_msg("[quickjs] Error: empty script\n".to_string());
-            } else {
-                // Run in a separate thread to avoid blocking
-                std::thread::spawn(move || {
-                    match quickjs_loader::execute_script(&script) {
-                        Ok(result) => {
-                            if !result.is_empty() {
-                                log_msg(format!("\x1b[32m=> {}\x1b[0m\n", result));
-                            }
-                        },
-                        Err(e) => log_msg(format!("[quickjs] Script error: {}\n", e)),
-                    }
-                });
-            }
-        },
-        #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             quickjs_loader::cleanup();
             log_msg("[quickjs] Cleaned up\n".to_string());
         },
         #[cfg(feature = "quickjs")]
-        Some("jseval") => {
-            let script = command.strip_prefix("jseval").unwrap_or("").trim().to_string();
+        Some("loadjs") => {
+            // 同步执行并通过 EVAL:/EVAL_ERR: 协议返回结果
+            let script = command.strip_prefix("loadjs").unwrap_or("").trim().to_string();
             if script.is_empty() {
                 if let Some(mut stream) = GLOBAL_STREAM.get() {
                     let _ = stream.write_all(b"EVAL_ERR:[quickjs] Error: empty script\n");

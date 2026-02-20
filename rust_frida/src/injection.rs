@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
 use crate::types::{LibcOffsets, DlOffsets, write_string_table};
-use crate::process::{get_libc_base, get_dl_base, attach_to_process, call_target_function, write_memory, write_bytes};
+use crate::process::{get_lib_base, attach_to_process, call_target_function, write_memory, write_bytes};
 use crate::{log_info, log_step, log_success, log_error, log_warn, log_addr};
 
 // 嵌入loader.bin
@@ -46,11 +46,11 @@ pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, S
 pub(crate) fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
     log_info!("正在附加到进程 PID: {}", pid);
 
-    // 获取自身和目标进程的 libc 基址
-    let self_base = get_libc_base(None)?;
-    let target_base = get_libc_base(Some(pid))?;
-    let self_dl_base = get_dl_base(None)?;
-    let target_dl_base = get_dl_base(Some(pid))?;
+    // 获取自身和目标进程的 libc / libdl 基址
+    let self_base = get_lib_base(None, "libc.so")?;
+    let target_base = get_lib_base(Some(pid), "libc.so")?;
+    let self_dl_base = get_lib_base(None, "libdl.so")?;
+    let target_dl_base = get_lib_base(Some(pid), "libdl.so")?;
 
     log_step!("自身 libc.so 基址: 0x{:x}", self_base);
     log_step!("目标进程 libc.so 基址: 0x{:x}", target_base);

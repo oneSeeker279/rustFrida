@@ -12,25 +12,85 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::{log_info, log_success, log_error, log_agent};
 
 pub(crate) static AGENT_MEMFD: AtomicI32 = AtomicI32::new(-1);
 pub(crate) static STOP_LISTENER: AtomicBool = AtomicBool::new(false);
 
-/// Shared state for synchronous jscomplete request/response.
-/// The Condvar is notified when the agent returns a COMPLETE: response.
-static COMPLETE_RESULT: OnceLock<(Mutex<Option<Vec<String>>>, Condvar)> = OnceLock::new();
-
-pub(crate) fn complete_state() -> &'static (Mutex<Option<Vec<String>>>, Condvar) {
-    COMPLETE_RESULT.get_or_init(|| (Mutex::new(None), Condvar::new()))
+/// 泛型同步通道：在多线程间传递单次值，支持超时等待。
+pub(crate) struct SyncChannel<T> {
+    mutex: Mutex<Option<T>>,
+    cvar: Condvar,
 }
 
-/// Shared state for synchronous jseval request/response.
-static EVAL_RESULT: OnceLock<(Mutex<Option<std::result::Result<String, String>>>, Condvar)> = OnceLock::new();
+impl<T: Clone> SyncChannel<T> {
+    pub(crate) fn new() -> Self {
+        SyncChannel { mutex: Mutex::new(None), cvar: Condvar::new() }
+    }
 
-pub(crate) fn eval_state() -> &'static (Mutex<Option<std::result::Result<String, String>>>, Condvar) {
-    EVAL_RESULT.get_or_init(|| (Mutex::new(None), Condvar::new()))
+    /// 设置值并通知所有等待者（由 handle_socket_connection 调用）。
+    pub(crate) fn send(&self, val: T) {
+        if let Ok(mut guard) = self.mutex.lock() {
+            *guard = Some(val);
+            self.cvar.notify_all();
+        }
+    }
+
+    /// 清除当前值。
+    pub(crate) fn clear(&self) {
+        if let Ok(mut guard) = self.mutex.lock() {
+            *guard = None;
+        }
+    }
+
+    /// 在持锁状态下清除值、调用 `f`（通常用于发送请求），再阻塞等待值到来或超时。
+    /// 保证"清除→发请求→等待"之间不存在竞态窗口。
+    pub(crate) fn clear_then_recv<F: FnOnce()>(&self, dur: Duration, f: F) -> Option<T> {
+        let mut guard = match self.mutex.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+        *guard = None;
+        f();
+        let result = self.cvar.wait_timeout_while(guard, dur, |val| val.is_none());
+        match result {
+            Ok((guard, timeout_result)) => {
+                if timeout_result.timed_out() { None } else { guard.clone() }
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// 阻塞等待值到来或超时（调用前需自行 clear）。
+    pub(crate) fn recv_timeout(&self, dur: Duration) -> Option<T> {
+        let guard = match self.mutex.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+        let result = self.cvar.wait_timeout_while(guard, dur, |val| val.is_none());
+        match result {
+            Ok((guard, timeout_result)) => {
+                if timeout_result.timed_out() { None } else { guard.clone() }
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+/// jscomplete 请求/响应的同步状态。
+static COMPLETE_RESULT: OnceLock<SyncChannel<Vec<String>>> = OnceLock::new();
+
+pub(crate) fn complete_state() -> &'static SyncChannel<Vec<String>> {
+    COMPLETE_RESULT.get_or_init(SyncChannel::new)
+}
+
+/// jseval（loadjs）请求/响应的同步状态。
+static EVAL_RESULT: OnceLock<SyncChannel<std::result::Result<String, String>>> = OnceLock::new();
+
+pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, String>> {
+    EVAL_RESULT.get_or_init(SyncChannel::new)
 }
 
 pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
@@ -104,33 +164,21 @@ pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
                 } else {
                     complete_part.lines().map(|s| s.to_string()).collect()
                 };
-                let (lock, cvar) = complete_state();
-                if let Ok(mut guard) = lock.lock() {
-                    *guard = Some(candidates);
-                    cvar.notify_all();
-                }
+                complete_state().send(candidates);
             } else if trimmed.contains("EVAL_ERR:") {
                 let err_part = if let Some(pos) = trimmed.find("EVAL_ERR:") {
                     &trimmed[pos + "EVAL_ERR:".len()..]
                 } else {
                     ""
                 };
-                let (lock, cvar) = eval_state();
-                if let Ok(mut guard) = lock.lock() {
-                    *guard = Some(Err(err_part.to_string()));
-                    cvar.notify_all();
-                }
+                eval_state().send(Err(err_part.to_string()));
             } else if trimmed.contains("EVAL:") {
                 let eval_part = if let Some(pos) = trimmed.find("EVAL:") {
                     &trimmed[pos + "EVAL:".len()..]
                 } else {
                     ""
                 };
-                let (lock, cvar) = eval_state();
-                if let Ok(mut guard) = lock.lock() {
-                    *guard = Some(Ok(eval_part.to_string()));
-                    cvar.notify_all();
-                }
+                eval_state().send(Ok(eval_part.to_string()));
             } else {
                 log_agent!("{}", trimmed);
             }

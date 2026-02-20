@@ -15,18 +15,17 @@ use std::process;
 use crate::types::UserRegs;
 use crate::{log_success};
 
-/// 获取 libc 基址
+/// 获取指定库的基址
 ///
 /// # 参数
-/// * `pid` - 进程ID，如果为 None 则获取当前进程的 libc 基址
-pub(crate) fn get_libc_base(pid: Option<i32>) -> Result<usize, String> {
-    // 构建 maps 文件路径
+/// * `pid`      - 进程ID，`None` 表示查询当前进程
+/// * `lib_name` - 要查找的库名称（如 "libc.so"、"libdl.so"）
+pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, String> {
     let maps_path = match pid {
         Some(pid) => format!("/proc/{}/maps", pid),
         None => "/proc/self/maps".to_string(),
     };
 
-    // 检查文件是否存在
     if !Path::new(&maps_path).exists() {
         return Err(format!("进程 {} 不存在", pid.unwrap_or(-1)));
     }
@@ -36,7 +35,7 @@ pub(crate) fn get_libc_base(pid: Option<i32>) -> Result<usize, String> {
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("读取maps文件失败: {}", e))?;
-        if line.contains("libc.so") {
+        if line.contains(lib_name) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(addr_range) = parts.get(0) {
                 if let Some(start_addr) = addr_range.split('-').next() {
@@ -47,42 +46,7 @@ pub(crate) fn get_libc_base(pid: Option<i32>) -> Result<usize, String> {
         }
     }
 
-    Err(format!("未找到进程 {} 的libc.so加载地址", pid.unwrap_or(-1)))
-}
-
-/// 获取 libdl.so 基址
-///
-/// # 参数
-/// * `pid` - 进程ID，如果为 None 则获取当前进程的 libdl.so 基址
-pub(crate) fn get_dl_base(pid: Option<i32>) -> Result<usize, String> {
-    // 构建 maps 文件路径
-    let maps_path = match pid {
-        Some(pid) => format!("/proc/{}/maps", pid),
-        None => "/proc/self/maps".to_string(),
-    };
-
-    // 检查文件是否存在
-    if !Path::new(&maps_path).exists() {
-        return Err(format!("进程 {} 不存在", pid.unwrap_or(-1)));
-    }
-
-    let file = File::open(&maps_path).map_err(|e| format!("无法打开maps文件: {}", e))?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("读取maps文件失败: {}", e))?;
-        if line.contains("libdl.so") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(addr_range) = parts.get(0) {
-                if let Some(start_addr) = addr_range.split('-').next() {
-                    return usize::from_str_radix(start_addr, 16)
-                        .map_err(|e| format!("解析地址失败: {}", e));
-                }
-            }
-        }
-    }
-
-    Err(format!("未找到进程 {} 的libdl.so加载地址", pid.unwrap_or(-1)))
+    Err(format!("未找到进程 {} 的{}加载地址", pid.unwrap_or(-1), lib_name))
 }
 
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {

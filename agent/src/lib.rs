@@ -23,8 +23,7 @@ use libc::{
 };
 use std::ffi::{c_void, CStr};
 use std::fmt::format;
-use std::io::Write;
-use std::io::{Error, Read};
+use std::io::{BufRead, BufReader, Error, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
@@ -673,33 +672,30 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
     std::thread::sleep(Duration::from_secs(2));
     flush_cached_logs();
 
-    // Fix #3: 循环等待命令，按 \n 逐行分割避免粘包
-    let mut buffer = [0u8; 1024];
+    // 循环等待命令：BufReader + read_line 确保任意长度命令完整接收（无截断）
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
     loop {
-        match stream.read(&mut buffer) {
-            Ok(size) if size > 0 => {
-                let data = std::str::from_utf8(&buffer[0..size]).unwrap_or("");
-                for line in data.split('\n') {
-                    let line = line.trim();
-                    if !line.is_empty() {
-                        process_cmd(line);
-                    }
-                    // Fix #4: shutdown 命令设置 SHOULD_EXIT，退出主循环
-                    if SHOULD_EXIT.load(Ordering::Relaxed) {
-                        break;
-                    }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // 连接关闭（EOF）
+                break;
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    process_cmd(trimmed);
                 }
                 if SHOULD_EXIT.load(Ordering::Relaxed) {
                     break;
                 }
             }
-            Ok(_) => {
-                // 连接关闭
-                break;
-            }
             Err(e) => {
                 // 读取错误
-                let _ = stream.write_all(format!("读取命令错误: {}", e).as_bytes());
+                if let Some(mut s) = GLOBAL_STREAM.get() {
+                    let _ = s.write_all(format!("读取命令错误: {}\n", e).as_bytes());
+                }
                 break;
             }
         }
@@ -835,6 +831,12 @@ fn process_cmd(command: &str) {
             if script.is_empty() {
                 if let Some(mut stream) = GLOBAL_STREAM.get() {
                     let _ = stream.write_all(b"EVAL_ERR:[quickjs] Error: empty script\n");
+                }
+            } else if !quickjs_loader::is_initialized() {
+                if let Some(mut stream) = GLOBAL_STREAM.get() {
+                    let _ = stream.write_all(
+                        "EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes(),
+                    );
                 }
             } else {
                 match quickjs_loader::execute_script(&script) {

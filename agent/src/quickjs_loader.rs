@@ -103,7 +103,6 @@ pub fn init() -> Result<(), String> {
     });
 
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
-    log_msg("[quickjs] Initialized successfully\n".to_string());
 
     Ok(())
 }

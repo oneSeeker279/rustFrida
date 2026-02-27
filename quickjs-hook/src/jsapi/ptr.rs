@@ -4,13 +4,11 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::value::JSValue;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use std::cell::Cell;
-
-/// Class ID for NativePointer - stored in thread-local to avoid Sync issues
-thread_local! {
-    static NATIVE_POINTER_CLASS_ID: Cell<u32> = const { Cell::new(0) };
-}
+/// Class ID for NativePointer — global (not thread_local) so hook callbacks on
+/// arbitrary threads share the same ID and inherit the prototype (toString etc.).
+static NATIVE_POINTER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 
 /// NativePointer class name
 const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
@@ -18,7 +16,7 @@ const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
 /// Finalizer called by QuickJS GC when a NativePointer object is collected.
 /// Frees the 8-byte heap allocation created by Box::into_raw in create_native_pointer.
 unsafe extern "C" fn native_pointer_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSValue) {
-    let class_id = NATIVE_POINTER_CLASS_ID.with(|id| id.get());
+    let class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
     if class_id == 0 {
         return;
     }
@@ -28,42 +26,38 @@ unsafe extern "C" fn native_pointer_finalizer(_rt: *mut ffi::JSRuntime, val: ffi
     }
 }
 
-/// Initialize NativePointer class and get the class ID.
+/// Get (or allocate + register) the NativePointer class ID on the given runtime.
 ///
-/// The class ID is allocated once per thread (thread_local) and reused across
-/// jsinit/jsclean cycles.  We must re-register the class on *every new runtime*
-/// because JS_FreeRuntime destroys all class registrations.
-/// JS_NewClass returns -1 (safely ignored) when the class is already registered
-/// on this runtime, so calling it unconditionally is idempotent.
+/// Allocation is global (AtomicU32), so all threads share the same class ID.
+/// JS_NewClass is called unconditionally — it returns -1 (no-op) if already
+/// registered on this runtime.
 fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
-    NATIVE_POINTER_CLASS_ID.with(|id| {
-        unsafe {
-            let rt = ffi::JS_GetRuntime(ctx);
+    let mut class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
 
-            // Allocate a stable class ID (only once per thread lifetime).
-            let class_id = if id.get() == 0 {
-                let mut new_id: u32 = 0;
-                new_id = ffi::JS_NewClassID(&mut new_id);
-                id.set(new_id);
-                new_id
-            } else {
-                id.get()
-            };
-
-            // Always register the class on the *current* runtime.
-            // If already registered on this runtime, JS_NewClass1 returns -1 (no-op).
-            let class_def = ffi::JSClassDef {
-                class_name: NATIVE_POINTER_CLASS_NAME.as_ptr() as *const _,
-                finalizer: Some(native_pointer_finalizer),
-                gc_mark: None,
-                call: None,
-                exotic: std::ptr::null_mut(),
-            };
-            let _ = ffi::JS_NewClass(rt, class_id, &class_def);
-
-            class_id
+    if class_id == 0 {
+        // Allocate a globally unique class ID (JS_NewClassID uses a global counter).
+        let mut new_id: u32 = 0;
+        new_id = unsafe { ffi::JS_NewClassID(&mut new_id) };
+        // CAS: if another thread beat us, use theirs.
+        match NATIVE_POINTER_CLASS_ID.compare_exchange(0, new_id, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => class_id = new_id,
+            Err(existing) => class_id = existing,
         }
-    })
+    }
+
+    unsafe {
+        let rt = ffi::JS_GetRuntime(ctx);
+        let class_def = ffi::JSClassDef {
+            class_name: NATIVE_POINTER_CLASS_NAME.as_ptr() as *const _,
+            finalizer: Some(native_pointer_finalizer),
+            gc_mark: None,
+            call: None,
+            exotic: std::ptr::null_mut(),
+        };
+        let _ = ffi::JS_NewClass(rt, class_id, &class_def);
+    }
+
+    class_id
 }
 
 /// Create a NativePointer object
@@ -83,7 +77,10 @@ pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
 
 /// Get address from NativePointer object
 pub fn get_native_pointer_addr(ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
-    let class_id = get_or_init_class_id(ctx);
+    let class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
+    if class_id == 0 {
+        return None;
+    }
 
     unsafe {
         let opaque = ffi::JS_GetOpaque(val.raw(), class_id);
@@ -95,7 +92,7 @@ pub fn get_native_pointer_addr(ctx: *mut ffi::JSContext, val: JSValue) -> Option
 }
 
 /// ptr() function implementation
-/// Accepts: number, string (hex), or NativePointer
+/// Accepts: number, string (hex), BigInt, or NativePointer
 unsafe extern "C" fn js_ptr(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -126,16 +123,25 @@ unsafe extern "C" fn js_ptr(
                 return ffi::JS_ThrowTypeError(ctx, b"Invalid hex string\0".as_ptr() as *const _)
             }
         };
-    } else if arg.is_int() || arg.is_float() {
-        // Number
-        addr = arg.to_i64(ctx).unwrap_or(0) as u64;
+    } else if arg.is_int() || arg.is_float()
+        || ffi::qjs_is_big_int(ctx, arg.raw()) != 0
+    {
+        // Number or BigInt (hook ctx.thisObj / ctx.args[] / ctx.x0-x30)
+        let mut v: u64 = 0;
+        if ffi::qjs_value_to_u64(ctx, &mut v, arg.raw()) != 0 {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"ptr() failed to convert numeric value\0".as_ptr() as *const _,
+            );
+        }
+        addr = v;
     } else if let Some(ptr_addr) = get_native_pointer_addr(ctx, arg) {
         // Already a NativePointer
         addr = ptr_addr;
     } else {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"ptr() argument must be number or string\0".as_ptr() as *const _,
+            b"ptr() argument must be number, string, or BigInt\0".as_ptr() as *const _,
         );
     }
 

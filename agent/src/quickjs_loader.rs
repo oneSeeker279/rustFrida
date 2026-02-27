@@ -6,8 +6,8 @@
 #![cfg(feature = "quickjs")]
 
 use quickjs_hook::{
-    cleanup_engine, cleanup_hook_engine, cleanup_hooks, complete_script, get_or_init_engine,
-    init_hook_engine, load_script, set_console_callback,
+    cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script,
+    get_or_init_engine, init_hook_engine, load_script, set_console_callback,
 };
 use libc::{mmap, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, sysconf, _SC_PAGESIZE};
 use std::ptr;
@@ -127,7 +127,9 @@ pub fn is_initialized() -> bool {
 /// Cleanup QuickJS resources
 pub fn cleanup() {
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // Unhook all hooks first while the JS context (ctx) is still valid
+    // Unhook Java hooks first (restore ArtMethod entry points)
+    cleanup_java_hooks();
+    // Unhook all inline hooks while the JS context (ctx) is still valid
     cleanup_hooks();
     // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime)
     cleanup_engine();

@@ -204,6 +204,36 @@ int qjs_to_big_int64(JSContext *ctx, int64_t *pres, JSValue val) {
     return JS_ToBigInt64(ctx, pres, val);
 }
 
+/* JS_ToInt64Ext wrapper — handles both Number AND BigInt */
+int qjs_to_int64_ext(JSContext *ctx, int64_t *pres, JSValue val) {
+    return JS_ToInt64Ext(ctx, pres, val);
+}
+
+/* Convert any numeric value (int, float, BigInt) to uint64_t.
+ * For BigInt: convert to string then parse (avoids internal API dependency).
+ * Returns 0 on success, -1 on failure. */
+int qjs_value_to_u64(JSContext *ctx, uint64_t *pres, JSValue val) {
+    if (JS_IsBigInt(ctx, val)) {
+        /* BigInt → string → strtoull */
+        JSValue str = JS_ToString(ctx, val);
+        if (JS_IsException(str)) {
+            *pres = 0;
+            return -1;
+        }
+        const char *cstr = JS_ToCString(ctx, str);
+        JS_FreeValue(ctx, str);
+        if (!cstr) {
+            *pres = 0;
+            return -1;
+        }
+        char *end;
+        *pres = strtoull(cstr, &end, 10);
+        JS_FreeCString(ctx, cstr);
+        return 0;
+    }
+    return JS_ToInt64(ctx, (int64_t *)pres, val);
+}
+
 /* JS_NULL constant */
 JSValue qjs_null(void) {
     return JS_NULL;

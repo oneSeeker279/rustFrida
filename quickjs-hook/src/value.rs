@@ -131,10 +131,10 @@ impl JSValue {
         }
     }
 
-    /// Convert to i64 (handles both int and BigInt)
+    /// Convert to i64 (handles int, float, AND BigInt via JS_ToInt64Ext)
     pub fn to_i64(&self, ctx: *mut ffi::JSContext) -> Option<i64> {
         let mut val: i64 = 0;
-        let ret = unsafe { ffi::qjs_to_int64(ctx, &mut val, self.0) };
+        let ret = unsafe { ffi::qjs_to_int64_ext(ctx, &mut val, self.0) };
         if ret == 0 {
             Some(val)
         } else {

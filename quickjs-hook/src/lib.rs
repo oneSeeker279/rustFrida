@@ -36,6 +36,7 @@ pub use completion::complete_script;
 pub use context::JSContext;
 pub use jsapi::console::set_console_callback;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use jsapi::java::cleanup_java_hooks;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
@@ -131,7 +132,9 @@ impl JSEngine {
 
 impl Drop for JSEngine {
     fn drop(&mut self) {
-        // Cleanup hooks before dropping context
+        // Cleanup Java hooks first (they depend on redirect thunks in the hook engine)
+        cleanup_java_hooks();
+        // Cleanup inline hooks before dropping context
         cleanup_hooks();
     }
 }

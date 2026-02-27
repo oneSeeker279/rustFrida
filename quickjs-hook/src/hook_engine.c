@@ -328,6 +328,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.exec_mem_used = 0;
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
+    g_engine.redirects = NULL;
     g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
     pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
@@ -817,6 +818,310 @@ void* hook_get_trampoline(void* target) {
     return result;
 }
 
+/* Generate a redirect thunk (pointer-based hooking, no inline patching).
+ *
+ * Layout: save context → call on_enter(ctx, user_data) → restore registers →
+ * BR x16 (tail-call to original_entry, preserving caller's LR).
+ */
+static void* generate_redirect_thunk(void* original_entry,
+                                      HookCallback on_enter,
+                                      void* user_data,
+                                      void* thunk_mem,
+                                      size_t* thunk_size_out) {
+    Arm64Writer w;
+    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+
+    /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) = 272 bytes
+     * Round up to 16-byte alignment: 288 bytes */
+    uint64_t stack_size = 288;
+    arm64_writer_put_sub_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+
+    /* Save x0-x30 to context on stack */
+    for (int i = 0; i < 30; i += 2) {
+        arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
+                                                 ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
+    }
+    /* Save x30 (LR) */
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+    /* Save SP (before our allocation) */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_X16, ARM64_REG_SP, stack_size);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_SP, 248);
+
+    /* Save original PC (original_entry address) to context.pc */
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)original_entry);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_SP, 256);
+
+    /* Save NZCV condition flags */
+    arm64_writer_put_mrs_reg(&w, ARM64_REG_X17, 0xDA10);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
+
+    /* Call on_enter(ctx, user_data) */
+    arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0, ARM64_REG_SP);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X1, (uint64_t)user_data);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)on_enter);
+    arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
+
+    /* Restore x0-x15 (arguments + scratch, possibly modified by callback) */
+    for (int i = 0; i < 16; i += 2) {
+        arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
+                                                 ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
+    }
+
+    /* Load original_entry into x16 for tail-call */
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)original_entry);
+
+    /* Restore x17-x18 (saved earlier by STP) */
+    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
+                                             ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
+
+    /* Restore x30 (LR) — critical: tail-call via BR preserves caller's LR */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+    /* Restore NZCV */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X19, ARM64_REG_SP, 264);
+    arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X19);
+    /* Restore x19 from context (we clobbered it for NZCV restore) */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X19, ARM64_REG_SP, 152);
+
+    /* Deallocate stack */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+
+    /* Tail-call to original entry: BR x16 (NOT BLR — preserves caller's LR) */
+    arm64_writer_put_br_reg(&w, ARM64_REG_X16);
+
+    arm64_writer_flush(&w);
+
+    *thunk_size_out = arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+
+    return thunk_mem;
+}
+
+/* Create a redirect hook — returns thunk address, caller writes it to the pointer slot */
+void* hook_create_redirect(uint64_t key, void* original_entry,
+                           HookCallback on_enter, void* user_data) {
+    if (!g_engine.initialized || !original_entry || !on_enter)
+        return NULL;
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    /* Check for duplicate */
+    HookRedirectEntry* cur = g_engine.redirects;
+    while (cur) {
+        if (cur->key == key) {
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        cur = cur->next;
+    }
+
+    if (pool_make_writable() != 0) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    /* Allocate entry in pool */
+    HookRedirectEntry* entry = (HookRedirectEntry*)hook_alloc(sizeof(HookRedirectEntry));
+    if (!entry) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+    memset(entry, 0, sizeof(HookRedirectEntry));
+
+    /* Allocate thunk memory */
+    void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+    if (!thunk_mem) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_size = 0;
+    void* thunk = generate_redirect_thunk(original_entry, on_enter, user_data,
+                                           thunk_mem, &thunk_size);
+    if (!thunk) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    entry->key = key;
+    entry->original_entry = original_entry;
+    entry->thunk = thunk;
+    entry->thunk_alloc = THUNK_ALLOC_SIZE;
+    entry->next = g_engine.redirects;
+    g_engine.redirects = entry;
+
+    hook_flush_cache(thunk, thunk_size);
+    pool_make_executable();
+
+    pthread_mutex_unlock(&g_engine.lock);
+    return thunk;
+}
+
+/* Remove a redirect hook — returns original entry point (caller restores the pointer) */
+void* hook_remove_redirect(uint64_t key) {
+    if (!g_engine.initialized) return NULL;
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    HookRedirectEntry* prev = NULL;
+    HookRedirectEntry* entry = g_engine.redirects;
+
+    while (entry) {
+        if (entry->key == key) {
+            void* original = entry->original_entry;
+
+            pool_make_writable();
+
+            if (prev) {
+                prev->next = entry->next;
+            } else {
+                g_engine.redirects = entry->next;
+            }
+
+            pool_make_executable();
+            pthread_mutex_unlock(&g_engine.lock);
+            return original;
+        }
+        prev = entry;
+        entry = entry->next;
+    }
+
+    pthread_mutex_unlock(&g_engine.lock);
+    return NULL;
+}
+
+/* Generate a native hook thunk (for replace-with-native approach).
+ *
+ * Similar to redirect thunk but ends with RET instead of BR to original.
+ * Used when a Java method is converted to native and this thunk serves
+ * as the native function implementation (stored in ArtMethod.data_).
+ *
+ * Layout: save context → call on_enter(ctx, user_data) → restore x0 → RET
+ */
+static void* generate_native_hook_thunk(HookCallback on_enter,
+                                         void* user_data,
+                                         void* thunk_mem,
+                                         size_t* thunk_size_out) {
+    Arm64Writer w;
+    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+
+    /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) = 272 bytes
+     * Round up to 16-byte alignment: 288 bytes */
+    uint64_t stack_size = 288;
+    arm64_writer_put_sub_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+
+    /* Save x0-x30 to context on stack */
+    for (int i = 0; i < 30; i += 2) {
+        arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
+                                                 ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
+    }
+    /* Save x30 (LR) */
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+    /* Save SP (before our allocation) */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_X16, ARM64_REG_SP, stack_size);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_SP, 248);
+
+    /* PC = 0 (not meaningful for native hooks) */
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, 0);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_SP, 256);
+
+    /* Save NZCV condition flags */
+    arm64_writer_put_mrs_reg(&w, ARM64_REG_X17, 0xDA10);
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
+
+    /* Call on_enter(ctx, user_data) */
+    arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0, ARM64_REG_SP);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X1, (uint64_t)user_data);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)on_enter);
+    arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
+
+    /* Restore x0 (return value, possibly modified by callback) */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+
+    /* Restore x30 (LR — return address set by ART's JNI trampoline) */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+    /* Deallocate stack */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+
+    /* Return to ART's JNI trampoline */
+    arm64_writer_put_ret(&w);
+
+    arm64_writer_flush(&w);
+    *thunk_size_out = arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+
+    return thunk_mem;
+}
+
+/* Create a native hook trampoline — called by ART's JNI trampoline as a native function.
+ * Returns the thunk address to be stored in ArtMethod.data_ field.
+ * Uses the redirect entry list for tracking (shares hook_remove_redirect for cleanup). */
+void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data) {
+    if (!g_engine.initialized || !on_enter)
+        return NULL;
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    /* Check for duplicate */
+    HookRedirectEntry* cur = g_engine.redirects;
+    while (cur) {
+        if (cur->key == key) {
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        cur = cur->next;
+    }
+
+    if (pool_make_writable() != 0) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    /* Allocate entry in pool */
+    HookRedirectEntry* entry = (HookRedirectEntry*)hook_alloc(sizeof(HookRedirectEntry));
+    if (!entry) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+    memset(entry, 0, sizeof(HookRedirectEntry));
+
+    /* Allocate thunk memory */
+    void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+    if (!thunk_mem) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_size = 0;
+    void* thunk = generate_native_hook_thunk(on_enter, user_data, thunk_mem, &thunk_size);
+    if (!thunk) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    entry->key = key;
+    entry->original_entry = NULL; /* no original entry for native hook */
+    entry->thunk = thunk;
+    entry->thunk_alloc = THUNK_ALLOC_SIZE;
+    entry->next = g_engine.redirects;
+    g_engine.redirects = entry;
+
+    hook_flush_cache(thunk, thunk_size);
+    pool_make_executable();
+
+    pthread_mutex_unlock(&g_engine.lock);
+    return thunk;
+}
+
 /* Cleanup all hooks */
 void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
@@ -856,6 +1161,7 @@ void hook_engine_cleanup(void) {
     /* Reset state — the list pointers are now dangling (pool about to be unmapped) */
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
+    g_engine.redirects = NULL;
     g_engine.exec_mem_used = 0;
     g_engine.initialized = 0;
 

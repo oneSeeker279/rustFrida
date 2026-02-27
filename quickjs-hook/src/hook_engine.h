@@ -55,6 +55,16 @@ typedef struct HookEntry {
     struct HookEntry* next;         /* Next entry in list */
 } HookEntry;
 
+/* Redirect entry — replaces a function pointer (e.g. ArtMethod entry_point)
+ * rather than patching inline code.  No instruction relocation needed. */
+typedef struct HookRedirectEntry {
+    uint64_t key;                   /* Unique identifier (e.g. ArtMethod* address) */
+    void* original_entry;           /* Original entry point (for restore on unhook) */
+    void* thunk;                    /* Generated redirect thunk */
+    size_t thunk_alloc;             /* Thunk allocated size */
+    struct HookRedirectEntry* next; /* Next entry in list */
+} HookRedirectEntry;
+
 /* Global hook engine state */
 typedef struct {
     void* exec_mem;                 /* Executable memory pool */
@@ -62,6 +72,7 @@ typedef struct {
     size_t exec_mem_used;           /* Used bytes */
     HookEntry* hooks;               /* Linked list of hooks */
     HookEntry* free_list;           /* Freed entries for reuse */
+    HookRedirectEntry* redirects;   /* Linked list of redirect hooks */
     pthread_mutex_t lock;           /* Thread safety lock */
     size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
@@ -172,6 +183,50 @@ typedef void (*HookLogFn)(const char* msg);
  * Pass NULL to disable logging.
  */
 void hook_engine_set_log_fn(HookLogFn fn);
+
+/*
+ * Create a redirect thunk for pointer-based hooking (e.g. ArtMethod entry_point).
+ *
+ * Generates a thunk that: saves context → calls on_enter(ctx, user_data) →
+ * restores registers → tail-calls original_entry via BR x16.
+ *
+ * Unlike hook_attach(), this does NOT patch target code or create a trampoline.
+ * The caller is responsible for writing the returned thunk address to the
+ * function pointer slot (e.g. ArtMethod->entry_point_from_quick_compiled_code_).
+ *
+ * @param key            Unique identifier (e.g. ArtMethod* address)
+ * @param original_entry Original function entry point (for tail-call after callback)
+ * @param on_enter       Callback called before the original function
+ * @param user_data      User data passed to callback
+ * @return               Thunk address on success, NULL on failure
+ */
+void* hook_create_redirect(uint64_t key, void* original_entry,
+                           HookCallback on_enter, void* user_data);
+
+/*
+ * Remove a redirect hook and return the original entry point.
+ *
+ * @param key            The key used when creating the redirect
+ * @return               Original entry point, NULL if not found
+ */
+void* hook_remove_redirect(uint64_t key);
+
+/*
+ * Create a native hook trampoline for ART "replace with native" hooking.
+ *
+ * Generates a thunk that: saves context → calls on_enter(ctx, user_data) →
+ * restores x0 (return value) → returns to caller (RET).
+ *
+ * This thunk is designed to be called by ART's JNI trampoline as a native
+ * method implementation. The callback receives x0=JNIEnv*, x1=jobject/jclass,
+ * x2-x7=Java args via HookContext.
+ *
+ * @param key            Unique identifier (e.g. ArtMethod* address)
+ * @param on_enter       Callback invoked when the method is called
+ * @param user_data      User data passed to callback
+ * @return               Thunk address (to store in ArtMethod.data_), NULL on failure
+ */
+void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data);
 
 #ifdef __cplusplus
 }

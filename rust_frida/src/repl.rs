@@ -254,9 +254,14 @@ pub(crate) fn print_help() {
     println!("{DIM}  unhook{RESET}       unhook(target_ptr)");
     println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
     println!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
+    println!("{DIM}  Java{RESET}         .use(class) → class wrapper (Proxy)");
+    println!("{DIM}             {RESET}  .method.impl = fn → hook (auto-detect overload)");
+    println!("{DIM}             {RESET}  .method.overload(sig).impl = fn");
+    println!("{DIM}             {RESET}  .method.impl = null → unhook");
     println!("{DIM}  示例:{RESET}");
     println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
     println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
+    println!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
     println!();
 }
 

@@ -4,8 +4,10 @@ mod args;
 mod communication;
 mod injection;
 mod logger;
+mod proc_mem;
 mod process;
 mod repl;
+mod spawn;
 mod types;
 
 use args::Args;
@@ -32,7 +34,7 @@ fn main() {
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
 
     // 解析 --name 到 PID（如果指定）
-    let target_pid: Option<i32> = if let Some(ref name) = args.name {
+    let resolved_pid: Option<i32> = if let Some(ref name) = args.name {
         match find_pid_by_name(name) {
             Ok(pid) => {
                 log_success!("按名称 '{}' 找到进程 PID: {}", name, pid);
@@ -75,27 +77,39 @@ fn main() {
         }
     }
 
-    // 根据参数选择注入方式，返回 host_fd
-    let host_fd: RawFd = if let Some(so_pattern) = &args.watch_so {
+    // 根据参数选择注入方式，返回 (target_pid, host_fd)
+    let (target_pid, host_fd): (Option<i32>, RawFd) = if let Some(ref package) = args.spawn {
+        // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
+        spawn::register_cleanup_handler();
+        // Spawn 模式：注入 Zygote 后启动 App
+        match spawn::spawn_and_inject(package, &string_overrides) {
+            Ok((pid, fd)) => (Some(pid), fd),
+            Err(e) => {
+                log_error!("Spawn 注入失败: {}", e);
+                spawn::cleanup_zygote_patches();
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
         match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
-            Ok(fd) => fd,
+            Ok(fd) => (resolved_pid, fd),
             Err(e) => {
                 log_error!("注入失败: {}", e);
                 std::process::exit(1);
             }
         }
-    } else if let Some(pid) = target_pid {
+    } else if let Some(pid) = resolved_pid {
         // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
         match inject_to_process(pid, &string_overrides) {
-            Ok(fd) => fd,
+            Ok(fd) => (Some(pid), fd),
             Err(e) => {
                 log_error!("注入失败: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
-        log_error!("必须指定 --pid、--name 或 --watch-so");
+        log_error!("必须指定 --pid、--name、--watch-so 或 --spawn");
         std::process::exit(1);
     };
 
@@ -192,6 +206,13 @@ fn main() {
             break;
         }
 
+        // Spawn 模式：检测是否收到终止信号（信号处理函数仅设标记，清理在此退出路径完成）
+        if args.spawn.is_some() && spawn::signal_received() {
+            log_info!("收到终止信号，正在退出...");
+            send_shutdown(sender);
+            break;
+        }
+
         match rl.readline("rustfrida> ") {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -256,6 +277,11 @@ fn main() {
     }
 
     let _ = rl.save_history(".rustfrida_history");
+
+    // Spawn 模式：退出前还原 Zygote patch
+    if args.spawn.is_some() {
+        spawn::cleanup_zygote_patches();
+    }
 
     // 等待 handler 线程退出（agent 关闭 socket 后 host 收到 EOF 自然退出）
     let _ = handle.join();

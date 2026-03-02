@@ -23,30 +23,35 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --pid 1234                         # 注入到指定 PID
   rustfrida --name com.example.app             # 按进程名注入
   rustfrida --watch-so libnative.so            # 等待 SO 加载后自动注入
+  rustfrida --spawn com.example.app            # Spawn 模式：启动前注入
   rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
 
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name"]))
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn"]))
 )]
 pub(crate) struct Args {
-    /// 目标进程的PID（与 --watch-so、--name 互斥）
+    /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
     #[arg(
         short,
         long,
-        conflicts_with_all = ["watch_so", "name"],
+        conflicts_with_all = ["watch_so", "name", "spawn"],
         allow_hyphen_values = true,
         value_parser = parse_pid
     )]
     pub(crate) pid: Option<i32>,
 
     /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程（需要 ldmonitor eBPF 组件：cargo build -p ldmonitor）
-    #[arg(short = 'w', long = "watch-so", conflicts_with = "name")]
+    #[arg(short = 'w', long = "watch-so", conflicts_with_all = ["name", "spawn"])]
     pub(crate) watch_so: Option<String>,
 
-    /// 按进程名注入（与 --pid、--watch-so 互斥）
-    #[arg(short = 'n', long = "name")]
+    /// 按进程名注入（与 --pid、--watch-so、--spawn 互斥）
+    #[arg(short = 'n', long = "name", conflicts_with = "spawn")]
     pub(crate) name: Option<String>,
+
+    /// Spawn 模式：启动 App 前注入，确保能 hook 到 Application.onCreate() 等早期代码
+    #[arg(short = 'f', long = "spawn")]
+    pub(crate) spawn: Option<String>,
 
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]

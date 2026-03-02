@@ -351,6 +351,119 @@ pub(crate) fn read_memory<T: Default>(pid: i32, addr: usize) -> Result<T, String
     Ok(val)
 }
 
+/// maps 条目结构
+#[derive(Debug, Clone)]
+pub(crate) struct MapEntry {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) perms: String,
+    pub(crate) offset: u64,
+    pub(crate) path: String,
+}
+
+impl MapEntry {
+    pub(crate) fn is_readable(&self) -> bool {
+        self.perms.starts_with('r')
+    }
+
+    pub(crate) fn is_writable(&self) -> bool {
+        self.perms.len() >= 2 && self.perms.as_bytes()[1] == b'w'
+    }
+
+    pub(crate) fn is_executable(&self) -> bool {
+        self.perms.len() >= 3 && self.perms.as_bytes()[2] == b'x'
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.perms.contains('s')
+    }
+}
+
+/// 结构化解析 /proc/<pid>/maps
+pub(crate) fn parse_proc_maps(pid: u32) -> Result<Vec<MapEntry>, String> {
+    let maps_path = format!("/proc/{}/maps", pid);
+    let file = File::open(&maps_path)
+        .map_err(|e| format!("无法打开 {}: {}", maps_path, e))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("读取 maps 失败: {}", e))?;
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let addr_parts: Vec<&str> = parts[0].split('-').collect();
+        if addr_parts.len() != 2 {
+            continue;
+        }
+
+        let start = u64::from_str_radix(addr_parts[0], 16)
+            .map_err(|e| format!("解析地址失败: {}", e))?;
+        let end = u64::from_str_radix(addr_parts[1], 16)
+            .map_err(|e| format!("解析地址失败: {}", e))?;
+
+        let perms = parts[1].to_string();
+        let offset = if parts.len() > 2 {
+            u64::from_str_radix(parts[2], 16).unwrap_or(0)
+        } else {
+            0
+        };
+        let path = if parts.len() >= 6 {
+            parts[5..].join(" ")
+        } else {
+            String::new()
+        };
+
+        entries.push(MapEntry {
+            start,
+            end,
+            perms,
+            offset,
+            path,
+        });
+    }
+
+    Ok(entries)
+}
+
+/// 读取 /proc/<pid>/stat 判断进程是否处于 stopped 状态
+pub(crate) fn is_process_stopped(pid: u32) -> bool {
+    let stat_path = format!("/proc/{}/stat", pid);
+    if let Ok(data) = std::fs::read_to_string(&stat_path) {
+        // /proc/pid/stat 格式: pid (comm) state ...
+        // state 在最后一个 ')' 之后的第一个非空字符
+        if let Some(pos) = data.rfind(')') {
+            let rest = &data[pos + 1..];
+            let state = rest.trim().chars().next().unwrap_or('?');
+            return state == 'T' || state == 't';
+        }
+    }
+    false
+}
+
+/// 递增延迟轮询等待进程停止（0/1/2/5/10/20/50/250ms），5s 超时
+pub(crate) fn wait_until_stopped(pid: u32) -> Result<(), String> {
+    let delays = [0, 1, 2, 5, 10, 20, 50, 250];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut idx = 0;
+
+    loop {
+        if is_process_stopped(pid) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("等待进程 {} 停止超时 (5s)", pid));
+        }
+        let delay = delays[idx.min(delays.len() - 1)];
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+        idx += 1;
+    }
+}
+
 /// 通过读 /proc/*/cmdline 按进程名查找 PID。
 /// 精确匹配（含末路径组件）；多匹配列出并返回错误。
 pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {

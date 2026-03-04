@@ -18,12 +18,22 @@
 #include <stdio.h>
 #include <errno.h>
 
-/* wxshadow prctl operations - shadow page patching */
-#ifndef PR_WXSHADOW_PATCH
-#define PR_WXSHADOW_PATCH   0x57580006  /* prctl(PR_WXSHADOW_PATCH, pid, addr, buf, len) */
+/* wxshadow prctl operations - three-step shadow page patching:
+ *   1. PREPARE: create shadow page at addr, make writable (rw-)
+ *   2. User writes hook bytes to addr (hits shadow page)
+ *   3. ACTIVE: switch mapping — reads see original, execution sees shadow (--x)
+ *   4. RELEASE: restore original mapping (for unhook)
+ *
+ * All operations: prctl(op, pid, addr) where pid=0 means current process.
+ */
+#ifndef PR_WXSHADOW_PREPARE
+#define PR_WXSHADOW_PREPARE 0x57580006  /* prctl(0x57580006, pid, addr) — create rw- shadow */
+#endif
+#ifndef PR_WXSHADOW_ACTIVE
+#define PR_WXSHADOW_ACTIVE  0x57580007  /* prctl(0x57580007, pid, addr) — switch to --x shadow */
 #endif
 #ifndef PR_WXSHADOW_RELEASE
-#define PR_WXSHADOW_RELEASE 0x57580008  /* prctl(PR_WXSHADOW_RELEASE, pid, addr, 0, 0) */
+#define PR_WXSHADOW_RELEASE 0x57580008  /* prctl(0x57580008, pid, addr) — restore original */
 #endif
 
 /* Minimum instructions to relocate for our jump sequence.
@@ -63,6 +73,7 @@ HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 int wxshadow_release(void* addr);
+int wxshadow_active(void* addr);
 int write_jump_back(void* dst, void* target, uint32_t written_regs);
 
 /* --- Core (hook_engine.c) --- */

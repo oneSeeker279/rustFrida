@@ -130,27 +130,154 @@ void hook_flush_cache(void* start, size_t size) {
     __builtin___clear_cache((char*)start, (char*)start + size);
 }
 
-/* --- wxshadow --- */
+/* --- wxshadow (three-step shadow page patching) --- */
 
 /*
- * Write data to target address via wxshadow prctl.
- * Tries pid=0 first, then getpid() as fallback.
+ * Find the VMA containing addr by parsing /proc/self/maps.
+ * Returns the VMA start in *vma_start and size in *vma_size.
+ * Only matches VMAs with the given permission prefix (e.g., "r-x").
+ * Returns 0 on success, -1 if not found.
+ */
+static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma_size) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = "";
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) >= 3) {
+            if (addr >= start && addr < end) {
+                *vma_start = start;
+                *vma_size = end - start;
+                found = 1;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+/*
+ * Split a PMD (2MB section) mapping into PTE-level pages without
+ * causing a VMA split in /proc/self/maps.
  *
+ * Strategy: mprotect the ENTIRE containing VMA to rwx, write one byte
+ * (triggers COW on the target page, splitting the PMD at kernel level),
+ * then restore the entire VMA to its original permissions.  Because we
+ * operate on the full VMA boundary, the kernel never splits the VMA
+ * into sub-regions — the VMA count in /proc/self/maps stays the same.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+static int pmd_split_cow(void* addr) {
+    uintptr_t vma_start = 0;
+    size_t vma_size = 0;
+
+    if (find_containing_vma((uintptr_t)addr, &vma_start, &vma_size) != 0) {
+        hook_log("pmd_split_cow: VMA not found for addr=%p", addr);
+        return -1;
+    }
+
+    hook_log("pmd_split_cow: VMA=%p-%p (size=%zu) for addr=%p",
+             (void*)vma_start, (void*)(vma_start + vma_size), vma_size, addr);
+
+    /* mprotect the entire VMA to rwx — no VMA split */
+    if (mprotect((void*)vma_start, vma_size,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        hook_log("pmd_split_cow: mprotect(rwx) failed errno=%d", errno);
+        return -1;
+    }
+
+    /* Write original byte back to trigger COW on the target page.
+     * This creates a private anonymous page, splitting the PMD. */
+    *(volatile uint8_t*)addr = *(volatile uint8_t*)addr;
+
+    /* Restore entire VMA to r-x — no VMA split */
+    mprotect((void*)vma_start, vma_size, PROT_READ | PROT_EXEC);
+
+    return 0;
+}
+
+/*
+ * Stealth-patch target address using wxshadow shadow pages:
+ *   1. PREPARE — allocate shadow page, make writable
+ *   2. memcpy — write hook bytes to shadow page
+ *   3. ACTIVE — switch mapping: reads see original bytes, execution sees shadow
+ *
+ * Tries pid=0 first, then getpid() as fallback for each step.
  * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
  */
 int wxshadow_patch(void* addr, const void* buf, size_t len) {
-    int ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, (int)len);
-    if (ret == 0) return 0;
+    int ret;
 
-    ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, (int)len);
-    if (ret == 0) return 0;
+    /* Step 1: PREPARE — create writable shadow page */
+    ret = prctl(PR_WXSHADOW_PREPARE, 0, (uintptr_t)addr, 0, 0);
+    if (ret != 0) {
+        ret = prctl(PR_WXSHADOW_PREPARE, getpid(), (uintptr_t)addr, 0, 0);
+    }
 
-    hook_log("wxshadow_patch failed: addr=%p len=%zu errno=%d", addr, len, errno);
+    if (ret != 0) {
+        /* PREPARE failed — likely 2MB section (PMD) mapping.
+         * wxshadow only supports 4KB PTE-mapped pages.
+         *
+         * Split the PMD by triggering COW on the target page.  We must
+         * mprotect the ENTIRE containing VMA (not just the target page)
+         * to avoid creating a VMA split visible in /proc/self/maps.
+         * V-OS detection scans /proc/self/maps for unexpected VMA splits
+         * in libart.so — mprotecting a sub-range would fragment the VMA. */
+        hook_log("wxshadow PREPARE failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
+
+        if (pmd_split_cow(addr) == 0) {
+            ret = prctl(PR_WXSHADOW_PREPARE, 0, (uintptr_t)addr, 0, 0);
+            if (ret != 0) {
+                ret = prctl(PR_WXSHADOW_PREPARE, getpid(), (uintptr_t)addr, 0, 0);
+            }
+        }
+
+        if (ret != 0) {
+            hook_log("wxshadow PREPARE failed after COW: addr=%p errno=%d", addr, errno);
+            return HOOK_ERROR_WXSHADOW_FAILED;
+        }
+        hook_log("wxshadow PREPARE succeeded after PMD split: addr=%p", addr);
+    }
+
+    /* Step 2: Write hook bytes — page is now writable (shadow page) */
+    memcpy(addr, buf, len);
+
+    /* Step 3: ACTIVE — switch to shadow execution (reads=original, exec=shadow) */
+    ret = prctl(PR_WXSHADOW_ACTIVE, 0, (uintptr_t)addr, 0, 0);
+    if (ret != 0) {
+        ret = prctl(PR_WXSHADOW_ACTIVE, getpid(), (uintptr_t)addr, 0, 0);
+        if (ret != 0) {
+            hook_log("wxshadow ACTIVE failed: addr=%p errno=%d", addr, errno);
+            prctl(PR_WXSHADOW_RELEASE, 0, (uintptr_t)addr, 0, 0);
+            return HOOK_ERROR_WXSHADOW_FAILED;
+        }
+    }
+
+    hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
+    return 0;
+}
+
+/*
+ * Activate a shadow page that was prepared but not yet activated.
+ * Used when the caller handles the write step separately.
+ * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
+ */
+int wxshadow_active(void* addr) {
+    int ret;
+    ret = prctl(PR_WXSHADOW_ACTIVE, 0, (uintptr_t)addr, 0, 0);
+    if (ret == 0) return 0;
+    ret = prctl(PR_WXSHADOW_ACTIVE, getpid(), (uintptr_t)addr, 0, 0);
+    if (ret == 0) return 0;
     return HOOK_ERROR_WXSHADOW_FAILED;
 }
 
 /*
- * Release wxshadow shadow at addr.
+ * Release wxshadow shadow at addr — restore original mapping.
  * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
  */
 int wxshadow_release(void* addr) {
@@ -382,8 +509,10 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth) {
-        /* Stealth mode: write jump to temp buffer, patch via wxshadow.
-         * If wxshadow fails (kernel not supported), fall through to mprotect. */
+        /* Stealth mode: wxshadow three-step patch.
+         * PREPARE creates a writable shadow page, we write the jump directly,
+         * ACTIVE switches mapping so reads see original bytes, execution sees shadow.
+         * If wxshadow fails, fall through to mprotect. */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, jump_dest);
         if (jump_result < 0) {

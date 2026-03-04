@@ -41,6 +41,7 @@ mod callback;
 mod java_hook_api;
 mod java_field_api;
 mod java_method_list_api;
+mod java_inspect_api;
 mod safe_mem;
 
 use crate::context::JSContext;
@@ -56,6 +57,7 @@ use callback::*;
 use java_hook_api::*;
 use java_field_api::*;
 use java_method_list_api::*;
+use java_inspect_api::*;
 use art_method::try_invalidate_jit_cache;
 use art_controller::{set_stealth_enabled, is_stealth_enabled};
 
@@ -180,6 +182,11 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "_getFieldAuto", js_java_get_field_auto, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
+
+        // 检测面测试 API
+        add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_setForcedInterpretOnly", js_java_set_forced_interpret_only, 1);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
 
         // Set Java object on global
         global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));

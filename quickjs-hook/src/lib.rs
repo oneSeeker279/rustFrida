@@ -63,7 +63,8 @@ pub(crate) fn mark_js_engine_owner_current_thread() {
 #[inline]
 pub(crate) fn clear_js_engine_owner_current_thread() {
     let current = current_thread_id_u64();
-    let _ = JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
+    let _ =
+        JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
 }
 
 /// Log callback registered with the C hook engine.

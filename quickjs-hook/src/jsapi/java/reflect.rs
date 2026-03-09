@@ -417,8 +417,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
         let c_array_get_length = CString::new("getLength").unwrap();
         let c_array_get_length_sig = CString::new("(Ljava/lang/Object;)I").unwrap();
         let c_array_get = CString::new("get").unwrap();
-        let c_array_get_sig =
-            CString::new("(Ljava/lang/Object;I)Ljava/lang/Object;").unwrap();
+        let c_array_get_sig = CString::new("(Ljava/lang/Object;I)Ljava/lang/Object;").unwrap();
         let c_boolean_value = CString::new("booleanValue").unwrap();
         let c_boolean_value_sig = CString::new("()Z").unwrap();
         let c_byte_value = CString::new("byteValue").unwrap();

@@ -96,7 +96,9 @@ fn main() {
             "cargo:warning=QuickJS source not initialized at {:?}",
             quickjs_src
         );
-        println!("cargo:warning=Run: git submodule update --init --recursive quickjs-hook/quickjs-src");
+        println!(
+            "cargo:warning=Run: git submodule update --init --recursive quickjs-hook/quickjs-src"
+        );
         println!("cargo:warning=Or run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 

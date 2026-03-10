@@ -42,8 +42,7 @@ tokio = "1"
 which = "7"
 
 [profile.release]
-strip = false
-debug = 2  # 保留行号信息，便于调试
+strip = true
 
 [profile.dev]
 strip = false

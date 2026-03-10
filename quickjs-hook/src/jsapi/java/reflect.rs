@@ -380,7 +380,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
         let double_cls = find_class(env, c_double_cls.as_ptr());
         jni_check_exc(env);
 
-        // Create a global ref for String class so it's usable from hook callbacks
+        // Create global refs for classes that must remain valid in hook callbacks
         let string_class = if !string_cls_local.is_null() {
             let g = new_global_ref(env, string_cls_local);
             delete_local_ref(env, string_cls_local);
@@ -702,6 +702,48 @@ pub(super) fn is_classloader_ready() -> bool {
     REFLECT_IDS
         .get()
         .map_or(false, |r| !r.app_classloader.is_null())
+}
+
+/// Resolve a class name directly via `Class.getName()`.
+///
+/// This is intended for JNI refs we already obtained from the VM, such as the
+/// result of `GetObjectClass()`, where ART-side ref decoding may be unavailable
+/// even though the JNI reference itself is valid.
+pub(crate) unsafe fn get_class_name_unchecked(env_ptr: u64, cls_ptr: u64) -> Option<String> {
+    let env = env_ptr as JniEnv;
+    let cls = cls_ptr as *mut std::ffi::c_void;
+    if env.is_null() || cls.is_null() {
+        return None;
+    }
+
+    let reflect = REFLECT_IDS.get()?;
+
+    let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
+    let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+    let rel_str: ReleaseStringUtfCharsFn =
+        jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let name_jstr = call_obj(env, cls, reflect.class_get_name_mid, std::ptr::null());
+    if name_jstr.is_null() {
+        jni_check_exc(env);
+        return None;
+    }
+
+    let chars = get_str(env, name_jstr, std::ptr::null_mut());
+    if chars.is_null() {
+        delete_local_ref(env, name_jstr);
+        jni_check_exc(env);
+        return None;
+    }
+
+    let name = std::ffi::CStr::from_ptr(chars)
+        .to_string_lossy()
+        .to_string();
+    rel_str(env, name_jstr, chars);
+    delete_local_ref(env, name_jstr);
+
+    Some(name)
 }
 
 /// Find a Java class by name. Tries JNI FindClass first (works for system/framework classes),

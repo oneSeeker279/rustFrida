@@ -76,7 +76,7 @@ pub(super) fn k_acc_compile_dont_bother() -> u32 {
 // JNI type aliases + helpers (module-level, shared across all functions)
 // ============================================================================
 
-pub(super) type JniEnv = *mut *const *const std::ffi::c_void;
+pub(crate) type JniEnv = *mut *const *const std::ffi::c_void;
 
 pub(super) type FindClassFn = unsafe extern "C" fn(JniEnv, *const c_char) -> *mut std::ffi::c_void;
 pub(super) type GetMethodIdFn = unsafe extern "C" fn(
@@ -756,7 +756,7 @@ pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
 ///
 /// JNIEnv is thread-local — each thread must use its own env pointer.
 /// AttachCurrentThread is idempotent (cheap if already attached).
-pub(super) fn ensure_jni_initialized() -> Result<JniEnv, String> {
+pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
     // Fast path: VM already found, just attach current thread
     {
         let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());

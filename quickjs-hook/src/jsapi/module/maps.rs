@@ -277,3 +277,50 @@ fn find_first_matching_path_start(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_by_address_returns_the_aggregated_module_range() {
+        let maps = "\
+1000-2000 r-xp 00000000 00:00 0 /tmp/libfoo.so
+2000-3000 r--p 00001000 00:00 0 /tmp/libfoo.so
+9000-a000 r-xp 00000000 00:00 0 /tmp/libfoo.so
+a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
+";
+
+        let module = find_module_by_address_in_entries(parse_module_map_entries(maps), 0x9500)
+            .expect("expected matching module");
+
+        assert_eq!(
+            module,
+            ModuleInfo {
+                name: "libfoo.so".to_string(),
+                base: 0x1000,
+                size: 0xa000,
+                path: "/tmp/libfoo.so".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn enumerate_modules_still_aggregates_by_path() {
+        let maps = "\
+1000-2000 r-xp 00000000 00:00 0 /tmp/libfoo.so
+2000-2800 r--p 00001000 00:00 0 /tmp/libfoo.so
+";
+
+        let modules = aggregate_modules(parse_module_map_entries(maps));
+
+        assert_eq!(
+            modules,
+            vec![ModuleInfo {
+                name: "libfoo.so".to_string(),
+                base: 0x1000,
+                size: 0x1800,
+                path: "/tmp/libfoo.so".to_string(),
+            }]
+        );
+    }
+}

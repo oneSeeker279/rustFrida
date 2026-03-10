@@ -284,15 +284,31 @@ pub(crate) fn print_help() {
     println!("{DIM}  unhook{RESET}       unhook(target_ptr)");
     println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
     println!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
+    println!("{DIM}  Module{RESET}       .findExportByName/.findBaseAddress/.findByAddress");
+    println!("{DIM}             {RESET}  .enumerateModules() → Array<{{name,base,size,path}}>");
     println!("{DIM}  Java{RESET}         .use(class) → class wrapper (Proxy)");
     println!("{DIM}             {RESET}  .$new(...args) → new Java object");
     println!("{DIM}             {RESET}  .method.impl = fn → hook (auto-detect overload)");
     println!("{DIM}             {RESET}  .method.overload(sig).impl = fn");
     println!("{DIM}             {RESET}  .method.impl = null → unhook");
+    println!("{DIM}  Jni{RESET}          .FindClass/.RegisterNatives ... → JNI 函数地址");
+    println!("{DIM}             {RESET}  .addr(env, \"FindClass\") / .addr(\"FindClass\")");
+    println!(
+        "{DIM}             {RESET}  .find(env, \"FindClass\") / .entries(env) / .table.FindClass"
+    );
+    println!("{DIM}             {RESET}  .helper.env.getObjectClassName(obj)");
+    println!("{DIM}             {RESET}  .helper.structs.JNINativeMethod.readArray(ptr, n)");
+    println!(
+        "{DIM}             {RESET}  .helper.structs.jvalue.readArray(ptr, \"(ILjava/lang/String;)V\")"
+    );
     println!("{DIM}  示例:{RESET}");
     println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
+    println!("{DIM}    jseval JSON.stringify(Module.findByAddress(ptr(0x7f000000))){RESET}");
     println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
     println!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
+    println!("{DIM}    loadjs hook(Jni.addr(\"FindClass\"), function(ctx){{console.log(Memory.readCString(ptr(ctx.x1))); return ctx.orig()}}){RESET}");
+    println!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.helper.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
+    println!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.helper.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
     println!(
         "{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}"
     );

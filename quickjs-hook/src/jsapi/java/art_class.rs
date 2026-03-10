@@ -181,6 +181,9 @@ unsafe fn scan_class_layout(
     f_entry_size: usize,
     m_entry_size: usize,
 ) -> Option<ArtClassSpec> {
+    // decode_jclass() may need safe_read_*() when DecodeJObject is unavailable.
+    refresh_mem_regions();
+
     let class_obj = match decode_jclass(env, cls_global) {
         Some(addr) => addr,
         None => {
@@ -189,9 +192,6 @@ unsafe fn scan_class_layout(
         }
     };
     output_message(&format!("[art class] mirror::Class* = {:#x}", class_obj));
-
-    // 刷新内存映射缓存，保护后续扫描
-    refresh_mem_regions();
 
     // 扫描 Class 对象查找字段数组和方法数组
     // LengthPrefixedArray<ArtField>: { u32 length, ArtField[length] } (4-aligned entries)
@@ -533,7 +533,7 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
     // 尝试: 将 ref 当作指针读取其指向的值
     let cls_val = cls as u64;
     if cls_val != 0 && cls_val > 0x1000 {
-        let deref = std::ptr::read_volatile(cls as *const u64);
+        let deref = safe_read_u64(cls_val);
         let stripped = deref & PAC_STRIP_MASK;
         // mirror::Class 对象应在合理堆地址范围
         if stripped > 0x1000_0000 && stripped < 0x0000_FFFF_0000_0000 {
@@ -545,7 +545,7 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
         }
 
         // 可能使用压缩指针 (32-bit)
-        let deref32 = std::ptr::read_volatile(cls as *const u32) as u64;
+        let deref32 = safe_read_u32(cls_val) as u64;
         if deref32 > 0x1000_0000 {
             output_message(&format!(
                 "[art class] IndirectRef 压缩指针解码: *ref(u32)={:#x}",
@@ -557,4 +557,18 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
 
     output_message("[art class] jclass 解码失败: DecodeJObject 不可用且 fallback 无效");
     None
+}
+
+/// Best-effort JNI ref validation for hook callbacks.
+///
+/// This avoids passing obviously bad register values into JNI object APIs.
+pub(super) unsafe fn is_valid_jni_ref(env: JniEnv, obj: *mut std::ffi::c_void) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+
+    with_runnable_thread(env, || {
+        refresh_mem_regions();
+        decode_jclass(env, obj).is_some()
+    })
 }

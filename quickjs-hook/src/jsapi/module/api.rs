@@ -2,6 +2,31 @@
 // JS API: Module namespace
 // ============================================================================
 
+use crate::jsapi::callback_util::extract_pointer_address;
+
+unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JSValue {
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+
+    let name_val = JSValue::string(ctx, &m.name);
+    let base_val = create_native_pointer(ctx, m.base);
+    // Keep module fields JSON-serializable. `base` is a NativePointer with `toJSON()`,
+    // and `size` must stay out of BigInt territory for JSON.stringify().
+    let size_val = if m.size <= i64::MAX as u64 {
+        JSValue(ffi::qjs_new_int64(ctx, m.size as i64))
+    } else {
+        JSValue::float(m.size as f64)
+    };
+    let path_val = JSValue::string(ctx, &m.path);
+
+    obj_val.set_property(ctx, "name", name_val);
+    obj_val.set_property(ctx, "base", base_val);
+    obj_val.set_property(ctx, "size", size_val);
+    obj_val.set_property(ctx, "path", path_val);
+
+    obj
+}
+
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
 ///
 /// moduleName == null → dlsym(RTLD_DEFAULT, symbolName)
@@ -102,6 +127,31 @@ unsafe extern "C" fn js_module_find_base(
     }
 }
 
+/// Module.findByAddress(addr) → {name, base, size, path} | null
+unsafe extern "C" fn js_module_find_by_address(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Module.findByAddress(addr) requires 1 argument\0".as_ptr() as *const _,
+        );
+    }
+
+    let addr = match extract_pointer_address(ctx, JSValue(*argv), "Module.findByAddress") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    match find_module_by_address(addr) {
+        Some(module) => module_info_to_js(ctx, &module),
+        None => JSValue::null().raw(),
+    }
+}
+
 /// Module.enumerateModules() → Array of {name, base, size, path}
 unsafe extern "C" fn js_module_enumerate(
     ctx: *mut ffi::JSContext,
@@ -113,20 +163,7 @@ unsafe extern "C" fn js_module_enumerate(
 
     let arr = ffi::JS_NewArray(ctx);
     for (i, m) in modules.iter().enumerate() {
-        let obj = ffi::JS_NewObject(ctx);
-        let obj_val = JSValue(obj);
-
-        let name_val = JSValue::string(ctx, &m.name);
-        let base_val = create_native_pointer(ctx, m.base);
-        let size_val = JSValue(ffi::JS_NewBigUint64(ctx, m.size));
-        let path_val = JSValue::string(ctx, &m.path);
-
-        obj_val.set_property(ctx, "name", name_val);
-        obj_val.set_property(ctx, "base", base_val);
-        obj_val.set_property(ctx, "size", size_val);
-        obj_val.set_property(ctx, "path", path_val);
-
-        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, obj);
+        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, module_info_to_js(ctx, m));
     }
 
     arr
@@ -152,6 +189,13 @@ pub fn register_module_api(ctx: &JSContext) {
             module_obj,
             "findBaseAddress",
             js_module_find_base,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "findByAddress",
+            js_module_find_by_address,
             1,
         );
         add_cfunction_to_object(

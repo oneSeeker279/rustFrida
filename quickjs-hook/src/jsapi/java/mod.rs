@@ -44,6 +44,9 @@ mod jni_core;
 mod reflect;
 mod safe_mem;
 
+pub(crate) use jni_core::ensure_jni_initialized;
+pub(crate) use reflect::get_class_name_unchecked;
+
 use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;

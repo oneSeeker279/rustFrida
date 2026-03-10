@@ -101,6 +101,10 @@ pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Optio
     }
 }
 
+fn format_native_pointer(addr: u64) -> String {
+    format!("0x{:x}", addr)
+}
+
 /// ptr() function implementation
 /// Accepts: number, string (hex), BigInt, or NativePointer
 unsafe extern "C" fn js_ptr(
@@ -271,7 +275,24 @@ unsafe extern "C" fn native_pointer_to_string(
         None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
     };
 
-    let s = format!("0x{:x}", addr);
+    let s = format_native_pointer(addr);
+    JSValue::string(ctx, &s).raw()
+}
+
+/// NativePointer.toJSON() implementation
+unsafe extern "C" fn native_pointer_to_json(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let this_val = JSValue(this);
+    let addr = match get_native_pointer_addr(ctx, this_val) {
+        Some(a) => a,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+
+    let s = format_native_pointer(addr);
     JSValue::string(ctx, &s).raw()
 }
 
@@ -310,6 +331,7 @@ pub fn register_ptr(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, proto, "add", native_pointer_add, 1);
         add_cfunction_to_object(ctx_ptr, proto, "sub", native_pointer_sub, 1);
         add_cfunction_to_object(ctx_ptr, proto, "toString", native_pointer_to_string, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toJSON", native_pointer_to_json, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toNumber", native_pointer_to_number, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toInt", native_pointer_to_number, 0);
 
@@ -318,4 +340,14 @@ pub fn register_ptr(ctx: &JSContext) {
     }
 
     global.free(ctx.as_ptr());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_native_pointer;
+
+    #[test]
+    fn formats_native_pointer_as_hex_string() {
+        assert_eq!(format_native_pointer(0x1234_abcd), "0x1234abcd");
+    }
 }

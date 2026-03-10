@@ -100,6 +100,9 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Restore x0 (return value, possibly modified by callback or callOriginal) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
 
+    /* Restore x18 (platform register) before returning to the original caller. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X18, ARM64_REG_SP, 144);
+
     /* Restore x30 (LR — return to the caller of the hooked function) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X30, ARM64_REG_SP, 240);
 
@@ -366,12 +369,13 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 __attribute__((naked))
 uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline) {
     __asm__ volatile(
-        /* Save callee-saved LR and the trampoline address */
+        /* Save callee-saved frame state and scratch callee-saved regs. */
         "stp    x29, x30, [sp, #-16]!\n"
         "mov    x29, sp\n"
+        "stp    x19, x20, [sp, #-16]!\n"
 
-        /* X0 = ctx, X1 = trampoline — save trampoline in X17 (scratch) */
-        "mov    x17, x1\n"
+        /* X0 = ctx, X1 = trampoline — keep trampoline in x19 until x16 is free. */
+        "mov    x19, x1\n"
 
         /* Restore x2-x15 from ctx first (before we clobber x0/x1) */
         "ldp    x2,  x3,  [x0, #16]\n"
@@ -381,12 +385,18 @@ uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline) {
         "ldp    x10, x11, [x0, #80]\n"
         "ldp    x12, x13, [x0, #96]\n"
         "ldp    x14, x15, [x0, #112]\n"
+        /* Restore x17-x18 (x18 is Android's platform register). */
+        "ldp    x17, x18, [x0, #136]\n"
 
         /* Restore x0-x1 from ctx (must be last since x0 = ctx pointer) */
         "ldp    x0,  x1,  [x0]\n"
 
+        /* Move trampoline into x16, then restore our scratch callee-saved regs. */
+        "mov    x16, x19\n"
+        "ldp    x19, x20, [sp], #16\n"
+
         /* Call the trampoline (original function) */
-        "blr    x17\n"
+        "blr    x16\n"
 
         /* x0 now contains the return value from the original function */
         /* Restore frame and return */

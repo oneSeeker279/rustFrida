@@ -67,6 +67,21 @@ pub(crate) fn clear_js_engine_owner_current_thread() {
         JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
 }
 
+struct JsEngineOwnerGuard;
+
+impl JsEngineOwnerGuard {
+    fn acquire() -> Self {
+        mark_js_engine_owner_current_thread();
+        JsEngineOwnerGuard
+    }
+}
+
+impl Drop for JsEngineOwnerGuard {
+    fn drop(&mut self) {
+        clear_js_engine_owner_current_thread();
+    }
+}
+
 /// Log callback registered with the C hook engine.
 /// Routes hook_engine diagnostic messages through the JS console callback
 /// so they appear in the REPL output alongside normal [JS] messages.
@@ -185,6 +200,7 @@ pub fn load_script(script: &str) -> Result<String, String> {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+    let _owner_guard = JsEngineOwnerGuard::acquire();
     let value = engine.eval(script)?;
     engine.run_pending_jobs();
     let result = if value.is_undefined() {
@@ -202,16 +218,5 @@ pub fn load_script(script: &str) -> Result<String, String> {
 pub fn cleanup_engine() {
     if let Ok(mut engine) = JS_ENGINE.lock() {
         *engine = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_engine_creation() {
-        // This test may fail if QuickJS is not built
-        // It's mainly for development verification
     }
 }

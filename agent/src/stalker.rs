@@ -9,6 +9,7 @@ use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use frida_gum::{Gum, ModuleMap, NativePointer, Process};
 use lazy_static::lazy_static;
 use prost::Message;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ffi::CString;

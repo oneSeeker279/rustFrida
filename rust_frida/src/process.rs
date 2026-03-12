@@ -7,7 +7,6 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
@@ -53,6 +52,25 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
         pid.unwrap_or(-1),
         lib_name
     ))
+}
+
+fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
+    let maps_path = format!("/proc/{}/maps", pid);
+    let mut file = File::open(&maps_path).ok()?;
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut raw).ok()?;
+
+    for line in String::from_utf8_lossy(&raw).lines() {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let mut it = range.split('-');
+        let start = u64::from_str_radix(it.next()?, 16).ok()?;
+        let end = u64::from_str_radix(it.next()?, 16).ok()?;
+        if addr >= start && addr < end {
+            return Some(line.to_string());
+        }
+    }
+    None
 }
 
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
@@ -202,7 +220,28 @@ pub(crate) fn call_target_function(
 
                     return Ok(return_value);
                 } else {
-                    return Err(format!("函数执行异常，PC = 0x{:x}", regs.pc));
+                    let pc_map = find_map_line_for_addr(pid, regs.pc)
+                        .unwrap_or_else(|| "<unknown mapping>".to_string());
+                    let lr_map = find_map_line_for_addr(pid, regs.regs[30])
+                        .unwrap_or_else(|| "<unknown mapping>".to_string());
+                    return Err(format!(
+                        concat!(
+                            "函数执行异常，",
+                            "PC=0x{:x} [{}], ",
+                            "LR=0x{:x} [{}], ",
+                            "SP=0x{:x}, ",
+                            "X0=0x{:x}, X1=0x{:x}, X2=0x{:x}, X3=0x{:x}"
+                        ),
+                        regs.pc,
+                        pc_map,
+                        regs.regs[30],
+                        lr_map,
+                        regs.sp,
+                        regs.regs[0],
+                        regs.regs[1],
+                        regs.regs[2],
+                        regs.regs[3]
+                    ));
                 }
             }
             WaitStatus::Stopped(_, Signal::SIGSTOP) => {

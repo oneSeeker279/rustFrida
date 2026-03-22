@@ -219,13 +219,9 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
         ));
         false
     } else {
-        // 验证 prctl 注册后 recomp 区域权限是否被改变
-        let test_ptr = unsafe { recomp_ptr.add(PAGE_SIZE + tramp_used) };
-        let test_val = unsafe { std::ptr::read_volatile(test_ptr) };
-        unsafe { std::ptr::write_volatile(test_ptr, test_val) }; // 写回相同值，测试写权限
         log_msg(format!(
-            "[recompiler] prctl 注册成功: 0x{:x} → 0x{:x} (write-test ok at tramp+{})",
-            orig_base, recomp_base, tramp_used
+            "[recompiler] prctl 注册成功: 0x{:x} → 0x{:x}",
+            orig_base, recomp_base
         ));
         true
     };
@@ -506,10 +502,10 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
         ptr::copy_nonoverlapping(recomp_code_addr as *const u8, orig_insn.as_mut_ptr(), 4);
     }
 
-    // 清零 slot 区域（recomp BRK guard 填充）
-    unsafe {
-        ptr::write_bytes(slot_ptr, 0, slot_size);
-    }
+    // slot 区域可能含 BRK guard 填充，不清零:
+    // - hook engine 写 thunk 时会覆盖 BRK
+    // - fixup_slot_trampoline 用真正原始指令重建 trampoline
+    // - commit_slot_patch 最后才激活 B 指令
 
     // B 指令范围预检查（commit_slot_patch 时才真正写入）
     let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);

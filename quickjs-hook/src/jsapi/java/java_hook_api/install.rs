@@ -175,10 +175,14 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         has_independent_code, original_entry_point
     ));
 
+    // current_pc_hint 统一传 0: replacement 已标记 kAccNative，
+    // ART JNI 路径会正确处理 native 方法的 frame。
+    // 不需要 fake hint PC，让 JNI trampoline 正常走完 epilogue。
     let thunk = hook_ffi::hook_create_native_trampoline(
         art_method,
         Some(java_hook_callback),
         art_method as *mut std::ffi::c_void,
+        0,
     );
 
     if thunk.is_null() {
@@ -222,14 +226,8 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
         let interp_bridge = bridge.quick_to_interpreter_bridge;
         if interp_bridge != 0 {
-            std::ptr::write_volatile(
-                (art_method as usize + ep_offset) as *mut u64,
-                interp_bridge,
-            );
-            hook_ffi::hook_flush_cache(
-                (art_method as usize + ep_offset) as *mut std::ffi::c_void,
-                8,
-            );
+            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
+            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
             output_message(&format!(
                 "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
                 original_entry_point, interp_bridge

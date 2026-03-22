@@ -157,9 +157,15 @@ pub(crate) unsafe extern "C" fn js_unhook(
     // Recomp 模式下 hook_remove 要用重编译后的地址
     let remove_addr = with_registry_mut(&HOOK_REGISTRY, |registry| {
         registry.get(&addr).map(|d| {
-            if d.mode == StealthMode::Recomp { d.recomp_addr } else { addr }
+            if d.mode == StealthMode::Recomp {
+                d.recomp_addr
+            } else {
+                addr
+            }
         })
-    }).flatten().unwrap_or(addr);
+    })
+    .flatten()
+    .unwrap_or(addr);
 
     let result = hook_ffi::hook_remove(remove_addr as *mut std::ffi::c_void);
 

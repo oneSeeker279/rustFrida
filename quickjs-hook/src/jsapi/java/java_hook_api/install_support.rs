@@ -217,6 +217,7 @@ pub(super) unsafe fn install_per_method_router_hook(
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
         let (hook_addr, sflag) = prepare_hook_target(original_entry_point as u64, env as *mut std::ffi::c_void)
             .map_err(|e| format!("prepare_hook_target: {}", e))?;
+        // current_pc_hint = 0: 不需要 LR/x20 swap，让 JNI 正常走 epilogue
         let trampoline = hook_ffi::hook_install_art_router(
             hook_addr as *mut std::ffi::c_void,
             ep_offset as u32,
@@ -224,14 +225,24 @@ pub(super) unsafe fn install_per_method_router_hook(
             env as *mut std::ffi::c_void,
             &mut hooked_target,
             1, // skip_resolve
+            0, // no hint — replacement is kAccNative, ART handles it
         );
 
         if trampoline.is_null() {
             return Err("hook_install_art_router failed".to_string());
         }
 
-        // clone 的 entry_point 指向 trampoline (callOriginal 用)
-        std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, trampoline as u64);
+        // clone 的 entry_point 设为 interpreter_bridge (对标 Frida):
+        // 让 callOriginal 走解释器执行 DEX bytecode，而不是 trampoline (relocated OAT code)。
+        // trampoline 的 PC 在 hook engine 内存中，不在原方法 OAT code range 内，
+        // 导致 WalkStack → GetDexPc 在原方法 CodeInfo 里找不到 StackMap entry → abort。
+        // 解释器路径产生正确的 frame 布局，WalkStack 可以安全遍历。
+        let clone_ep = if bridge.quick_to_interpreter_bridge != 0 {
+            bridge.quick_to_interpreter_bridge
+        } else {
+            trampoline as u64
+        };
+        std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, clone_ep);
         hook_ffi::hook_flush_cache((clone_addr as usize + ep_offset) as *mut std::ffi::c_void, 8);
 
         let actual_hook_target = if !hooked_target.is_null() {
@@ -260,8 +271,7 @@ pub(super) unsafe fn install_per_method_router_hook(
         let resolved_interp = bridge.resolved_interpreter_bridge_entrypoint;
         let resolved_res = bridge.resolved_resolution_entrypoint;
 
-        let is_already_routed =
-            original_entry_point == bridge.quick_to_interpreter_bridge
+        let is_already_routed = original_entry_point == bridge.quick_to_interpreter_bridge
             || original_entry_point == bridge.quick_resolution_trampoline
             || (resolved_interp != 0 && original_entry_point == resolved_interp)
             || (resolved_res != 0 && original_entry_point == resolved_res);

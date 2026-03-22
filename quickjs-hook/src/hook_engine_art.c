@@ -145,6 +145,12 @@ void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
 #define ROUTER_FRAME_GPR_OFF  16  /* x0(16) */
 #define ROUTER_FRAME_SIZE    224  /* 64 + 144 + 16 */
 
+/* Named offsets for specific saved registers within the router frame.
+ * x20 is the second reg in STP x7,x20 at GPR_OFF+48 → offset 72.
+ * LR  is the second reg in STP x29,lr at GPR_OFF+128 → offset 152. */
+#define ROUTER_SAVED_X20_OFF (ROUTER_FRAME_GPR_OFF + 48 + 8)   /* 72 */
+#define ROUTER_SAVED_LR_OFF  (ROUTER_FRAME_GPR_OFF + 128 + 8)  /* 152 */
+
 static void emit_art_router_prologue(Arm64Writer* w) {
     /* 分配整个帧 */
     arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
@@ -229,7 +235,8 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
  * declaring_class_ 仅通过 GC 回调 (synchronize_replacement_methods) 批量同步。
  * 在 trampoline 里写 malloc 地址会导致 Scudo 堆损坏（spawn 模式已验证）。 */
 static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
-                                        uint32_t quickcode_offset) {
+                                        uint32_t quickcode_offset,
+                                        uint64_t current_pc_hint) {
     arm64_writer_put_label(w, lbl_found);
     /* Debug: increment hit counter (X17=original, X16=&table[i]) */
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X0, (uint64_t)&g_art_router_hit_count);
@@ -241,10 +248,13 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     /* 把 replacement 写入 saved x0 slot (对标 Frida: overwrite saved x0 with replacement) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);  /* X17 = replacement */
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);   /* saved_x0 = replacement */
-    /* 加载 replacement.quickCode 到 X16 (恢复寄存器后跳转) */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, (int64_t)quickcode_offset);
-    /* 恢复全部寄存器 (x0 从 saved slot 读取 = replacement ArtMethod*) */
+    /* 不做 LR/x20 swap。replacement 已标记 kAccNative，ART JNI 路径会正确处理。
+     * 之前的 swap 会导致 native thunk 绕过 GenericJniMethodEnd，
+     * JNI transition frame 泄漏在栈上 → GC WalkStack 查 StackMap abort。
+     * 保持 LR = caller 真实返回地址，让 JNI 正常走完 epilogue。 */
     emit_art_router_restore_all(w);
+    /* 恢复后 X0 = replacement ArtMethod*, 从中加载 quickCode 到 X16 */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, (int64_t)quickcode_offset);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
 
@@ -270,7 +280,8 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
 
 static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
                                          void* trampoline_target,
-                                         uint32_t quickcode_offset) {
+                                         uint32_t quickcode_offset,
+                                         uint64_t current_pc_hint) {
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_alloc);
 
@@ -278,7 +289,7 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
 
     uint64_t lbl_found, lbl_not_found;
     emit_art_router_scan_loop(&w, &lbl_found, &lbl_not_found);
-    emit_art_router_found_path(&w, lbl_found, quickcode_offset);
+    emit_art_router_found_path(&w, lbl_found, quickcode_offset, current_pc_hint);
 
     /* === not_found path: fall through to trampoline === */
     emit_art_router_not_found_path(&w, lbl_not_found, (uint64_t)trampoline_target);
@@ -356,7 +367,8 @@ void* resolve_art_trampoline(void* target, void* jni_env) {
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
                                void** out_hooked_target,
-                               int skip_resolve) {
+                               int skip_resolve,
+                               uint64_t current_pc_hint) {
     if (!g_engine.initialized || !target) {
         return NULL;
     }
@@ -391,23 +403,9 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
-    /* Recomp 模式: 只覆盖 4 字节 (B 指令)，保持 recomp 页 offset 对应 */
-    if (stealth == 2) {
-        entry->original_size = 4;
-    }
-
-    /* Allocate thunk (router code — larger than default).
-     * stealth==2 (recomp) 用 B 指令 (±128MB)，需要更严格的距离约束。
-     * 其他模式用 ADRP/MOVZ 无严格距离限制。
-     * 注意: 对 stealth==2 必须忽略 free list 中复用的 thunk（距离可能不对）。 */
+    /* Allocate thunk (router code — larger than default) */
     size_t art_thunk_alloc = 1024;
-    if (stealth == 2) {
-        /* stealth2: 强制重新分配 ±128MB 范围内的 thunk，不复用旧的 */
-        void* old_thunk = entry->thunk;
-        entry->thunk = hook_alloc_near_range(art_thunk_alloc, target, (int64_t)1 << 27);
-        entry->thunk_alloc = art_thunk_alloc;
-        hook_log("[art_router] stealth2 thunk alloc: target=%p old=%p new=%p", target, old_thunk, entry->thunk);
-    } else if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
+    if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
     }
@@ -426,16 +424,14 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     /* Generate router thunk — not_found path jumps to trampoline */
     size_t thunk_size = generate_art_router_thunk(
         entry->thunk, art_thunk_alloc,
-        entry->trampoline, quickcode_offset);
+        entry->trampoline, quickcode_offset, current_pc_hint);
     if (thunk_size == 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
-    /* Patch target to jump to router thunk.
-     * stealth==2 (recomp): thunk 已在 ±128MB 内分配，B 直接跳 thunk。
-     * stealth==0/1: ADRP/MOVZ 无距离限制。 */
+    /* Patch target to jump to router thunk */
     void* patch_dest = entry->thunk;
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
@@ -485,7 +481,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     uint64_t lbl_found, lbl_not_found;
     emit_art_router_scan_loop(&w, &lbl_found, &lbl_not_found);
-    emit_art_router_found_path(&w, lbl_found, quickcode_offset);
+    emit_art_router_found_path(&w, lbl_found, quickcode_offset, 0);
 
     /* === not_found path: jump to fallback === */
     emit_art_router_not_found_path(&w, lbl_not_found, fallback_target);

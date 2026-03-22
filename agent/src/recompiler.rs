@@ -51,6 +51,7 @@ extern "C" {
     fn hook_flush_cache(start: *mut libc::c_void, size: usize);
     fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
     fn hook_mmap_near(target: *mut libc::c_void, alloc_size: usize) -> *mut libc::c_void;
+    fn hook_register_pool(base: *mut libc::c_void, size: usize) -> i32;
 }
 
 /// C 侧的 RecompileStats 对应结构
@@ -165,10 +166,10 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
     let _ = set_anon_vma_name_raw(recomp_ptr, PAGE_SIZE, VMA_RECOMP_CODE);
     let _ = set_anon_vma_name_raw(tramp_ptr, tramp_capacity, VMA_RECOMP_TRAMP);
 
-    // 刷新 icache + 设为 R-X
+    // 刷新 icache + 代码页设为 R-X；跳板区保持 RWX（alloc_trampoline_slot 需要写 B 指令 + slot 数据）
     unsafe {
-        hook_flush_cache(recomp_ptr as *mut _, total_size);
-        mprotect(recomp_ptr as *mut _, total_size, PROT_READ | PROT_EXEC);
+        hook_flush_cache(recomp_ptr as *mut _, PAGE_SIZE + tramp_used);
+        mprotect(recomp_ptr as *mut _, PAGE_SIZE, PROT_READ | PROT_EXEC);
     }
 
     log_msg(format!(

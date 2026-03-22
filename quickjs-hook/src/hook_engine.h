@@ -68,7 +68,7 @@ typedef struct HookRedirectEntry {
 } HookRedirectEntry;
 
 /* 可执行内存 pool（多个，按需靠近 hook 目标分配） */
-#define MAX_EXEC_POOLS 16
+#define MAX_EXEC_POOLS 64
 #define EXEC_POOL_SIZE (64 * 1024)  /* 每个 pool 64KB */
 
 typedef struct {
@@ -152,6 +152,12 @@ void hook_engine_cleanup(void);
  * @param size          Number of bytes to allocate
  * @return              Pointer to allocated memory, NULL on failure
  */
+/* 注册外部分配的 RWX 内存为 ExecPool（供 hook_alloc_near_range 使用）。
+ * recomp 页在 mmap 时附带分配 hook slot 区，注册后 hook engine 可直接使用，
+ * 避免二次 near-range 分配失败。
+ * 返回 0 成功，-1 失败（pool 数量已满）。 */
+int hook_register_pool(void* base, size_t size);
+
 /* Allocate from any pool (legacy, no locality guarantee) */
 void* hook_alloc(size_t size);
 
@@ -257,7 +263,8 @@ void* hook_remove_redirect(uint64_t key);
  * @param user_data      User data passed to callback
  * @return               Thunk address (to store in ArtMethod.data_), NULL on failure
  */
-void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data);
+void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data,
+                                    uint64_t current_pc_hint);
 
 /*
  * ART router lookup table — inline C-side table for O(N) scan in generated thunk.
@@ -348,7 +355,8 @@ void hook_art_router_reset_debug(void);
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
                                void** out_hooked_target,
-                               int skip_resolve);
+                               int skip_resolve,
+                               uint64_t current_pc_hint);
 
 /*
  * Resolve tiny ART trampolines (LDR Xt,[X19,#imm]; BR Xt) to actual target.

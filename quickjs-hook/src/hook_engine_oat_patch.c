@@ -299,8 +299,14 @@ static void* generate_oat_inline_trampoline(
     int patch_size,
     OatInlineMatch* match)
 {
-    /* Allocate trampoline from exec pool */
-    void* trampoline = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
+    /* Allocate trampoline: 优先在 ±128MB 内分配（recomp hook slot pool），
+     * 这样 apply_oat_inline_patch 可以用 ADRP+ADD+BR (12字节) 跳过来，
+     * 只覆盖 pattern 的 3 条指令，不会吞掉第 4 条 ADRP。
+     * 如果 near_range 失败（非 stealth2），退回 hook_alloc_near。 */
+    void* trampoline = hook_alloc_near_range(512, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
+    if (!trampoline) {
+        trampoline = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
+    }
     if (!trampoline) {
         hook_log("[oat_patch] trampoline alloc failed");
         return NULL;

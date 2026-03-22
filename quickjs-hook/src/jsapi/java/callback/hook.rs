@@ -77,6 +77,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         return;
     }
     let _in_flight_guard = InFlightJavaHookGuard::enter();
+    let _callback_scope = JavaHookCallbackScope::enter();
 
     // user_data is ArtMethod* address (used as registry key)
     let art_method_addr = user_data as u64;
@@ -250,7 +251,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             } else {
                 std::ptr::null()
             };
-            (*ctx_ptr).x[0] = invoke_clone_jni(
+            let ret_raw = invoke_clone_jni(
                 env,
                 art_method_addr,
                 clone_addr,
@@ -260,6 +261,13 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 is_static,
                 jargs_ptr,
             );
+            if return_type == b'V' {
+                // Void methods, especially constructors, must preserve the original
+                // JNIEnv* in x0 for ART's GenericJNI epilogue.
+                (*ctx_ptr).x[0] = hook_ctx.x[0];
+            } else {
+                (*ctx_ptr).x[0] = ret_raw;
+            }
         } else {
             (*ctx_ptr).x[0] = 0;
         }

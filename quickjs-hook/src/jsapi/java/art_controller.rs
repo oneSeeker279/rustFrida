@@ -121,11 +121,13 @@ unsafe fn prepare_hook_target_inner(
         StealthMode::Normal => Ok((real_addr, 0)),
         StealthMode::WxShadow => Ok((real_addr, 1)),
         StealthMode::Recomp => {
-            // Recomp 模式: hook 装在 recomp 页上，只覆盖 4 字节 (B 指令)。
-            // sflag=2 让 hook engine 用 B 指令而不是 full jump，保持 offset 对应。
-            let recomp = crate::recomp::ensure_and_translate(real_addr as usize)
+            // Recomp 模式: recomp 代码页上写 1 条 B→slot，slot 里由 hook engine 写 thunk。
+            // sflag=0 让 hook engine 把 slot 当普通地址处理，无需知道 stealth2。
+            crate::recomp::ensure_and_translate(real_addr as usize)
                 .map_err(|e| format!("recomp translate {:#x}: {}", real_addr, e))?;
-            Ok((recomp as u64, 2))
+            let slot = crate::recomp::alloc_trampoline_slot(real_addr as usize)
+                .map_err(|e| format!("recomp slot {:#x}: {}", real_addr, e))?;
+            Ok((slot as u64, 0))
         }
     }
 }
@@ -362,6 +364,7 @@ pub(super) fn ensure_art_controller_initialized(
                 env,
                 &mut hooked_target,
                 1, // skip_resolve: 已在 prepare_hook_target 中 resolve
+                0, // no hint — replacement is kAccNative, ART handles it
             )
         };
         if !trampoline.is_null() {

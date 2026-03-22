@@ -26,6 +26,8 @@ void arm64_relocator_init(Arm64Relocator* r, const void* input, uint64_t input_p
     r->region_end = 0;
     memset(r->region_labels, 0, sizeof(r->region_labels));
     r->written_regs = 0;
+    r->preserve_call_return_to_original = 0;
+    r->original_call_return_pc = 0;
 }
 
 void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_pc) {
@@ -40,6 +42,8 @@ void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_
     r->region_end = 0;
     memset(r->region_labels, 0, sizeof(r->region_labels));
     r->written_regs = 0;
+    r->preserve_call_return_to_original = 0;
+    r->original_call_return_pc = 0;
 }
 
 void arm64_relocator_clear(Arm64Relocator* r) {
@@ -462,6 +466,31 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
 
     /* Track which GPRs this instruction writes (for scratch register selection) */
     track_written_regs(r, r->current_insn, &r->current_info);
+
+    /* Single-instruction trampoline mode:
+     * BL/BLR must not leak the relocated/trampoline PC into LR. */
+    if (r->preserve_call_return_to_original) {
+        switch (r->current_info.type) {
+            case ARM64_INSN_BL:
+                arm64_writer_put_mov_reg_imm(r->output, ARM64_REG_X30, r->original_call_return_pc);
+                arm64_writer_put_branch_address_reg(r->output, r->current_info.target, ARM64_REG_X17);
+                return ARM64_RELOC_OK;
+
+            case ARM64_INSN_BLR:
+                if (r->current_info.reg == ARM64_REG_X30) {
+                    arm64_writer_put_mov_reg_reg(r->output, ARM64_REG_X17, ARM64_REG_X30);
+                    arm64_writer_put_mov_reg_imm(r->output, ARM64_REG_X30, r->original_call_return_pc);
+                    arm64_writer_put_br_reg(r->output, ARM64_REG_X17);
+                } else {
+                    arm64_writer_put_mov_reg_imm(r->output, ARM64_REG_X30, r->original_call_return_pc);
+                    arm64_writer_put_br_reg(r->output, r->current_info.reg);
+                }
+                return ARM64_RELOC_OK;
+
+            default:
+                break;
+        }
+    }
 
     if (!r->current_info.is_pc_relative) {
         /* Non-PC-relative instruction, just copy it */

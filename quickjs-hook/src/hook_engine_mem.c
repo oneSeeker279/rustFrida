@@ -559,6 +559,20 @@ static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
 }
 
 
+int hook_register_pool(void* base, size_t size) {
+    if (!g_engine.initialized || !base || size == 0) return -1;
+    if (g_engine.pool_count >= MAX_EXEC_POOLS) {
+        hook_log("hook_register_pool: pool slots exhausted (%d)", g_engine.pool_count);
+        return -1;
+    }
+    ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
+    pool->base = base;
+    pool->size = size;
+    pool->used = 0;
+    hook_log("hook_register_pool: base=%p size=%zu (pool #%d)", base, size, g_engine.pool_count - 1);
+    return 0;
+}
+
 void* hook_alloc(size_t size) {
     if (!g_engine.initialized) return NULL;
     size = (size + 7) & ~7;
@@ -677,6 +691,10 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
 
     arm64_writer_init(&w, dst, (uint64_t)dst, 256);
     arm64_relocator_init(&r, src_buf, src_pc, &w);
+    if (min_bytes == INSN_SIZE) {
+        r.preserve_call_return_to_original = 1;
+        r.original_call_return_pc = src_pc + INSN_SIZE;
+    }
 
     /* Pre-create one label per source instruction in the hook region. */
     int n = (int)(min_bytes / INSN_SIZE);
@@ -783,31 +801,6 @@ int build_trampoline(HookEntry* entry) {
 
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
-
-    if (stealth == 2) {
-        /* Recomp 模式: 写 4 字节 B 指令到 recomp 页。
-         * recomp 内核模块只改原始页 PTE，不碰 recomp 页，mprotect 安全。 */
-        int64_t b_offset = (int64_t)(uintptr_t)jump_dest - (int64_t)(uintptr_t)target;
-        if (b_offset < -(1 << 27) || b_offset >= (1 << 27)) {
-            hook_log("\033[31m[STEALTH 失效] recomp B 指令距离超限 %p (offset=%lld)，hook 安装失败！\033[0m",
-                     target, (long long)b_offset);
-            return HOOK_ERROR_BUFFER_TOO_SMALL;
-        }
-        uint32_t b_imm26 = ((uint32_t)(b_offset >> 2)) & 0x3FFFFFF;
-        uint32_t b_insn = 0x14000000 | b_imm26;
-
-        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            return HOOK_ERROR_MPROTECT_FAILED;
-        }
-        *(volatile uint32_t*)target = b_insn;
-        hook_flush_cache(target, 4);
-        entry->stealth = 2;
-        entry->original_size = 4;
-        restore_page_rx(page_start);
-
-        return 0;
-    }
 
     if (stealth == 1) {
         /* wxshadow 模式: 一步写入 shadow 页.

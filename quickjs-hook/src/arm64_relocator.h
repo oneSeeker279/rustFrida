@@ -114,6 +114,14 @@ typedef struct {
      * Used to dynamically select a scratch register for the jump-back sequence
      * that won't clobber a value set by the relocated code. */
     uint32_t written_regs;
+
+    /* Single-instruction trampoline mode:
+     * relocate exactly one overwritten instruction, and if it is BL/BLR to an
+     * external target, preserve the original return PC instead of returning to
+     * the relocated copy. This is required by stealth2 recomp trampolines so
+     * LR/quick-frame metadata stays in the original code range. */
+    int preserve_call_return_to_original;
+    uint64_t original_call_return_pc;
 } Arm64Relocator;
 
 /* ============================================================================

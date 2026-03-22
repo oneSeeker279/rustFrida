@@ -14,12 +14,36 @@ use crate::jsapi::callback_util::{
     throw_internal_error, throw_type_error, BiMap,
 };
 use crate::value::JSValue;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::{Condvar, Mutex};
 
 use super::jni_core::*;
 use super::reflect::{find_class_safe, REFLECT_IDS};
+
+thread_local! {
+    static IN_JAVA_HOOK_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) struct JavaHookCallbackScope;
+
+impl JavaHookCallbackScope {
+    pub(super) fn enter() -> Self {
+        IN_JAVA_HOOK_CALLBACK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Drop for JavaHookCallbackScope {
+    fn drop(&mut self) {
+        IN_JAVA_HOOK_CALLBACK.with(|flag| flag.set(false));
+    }
+}
+
+pub(super) fn in_java_hook_callback() -> bool {
+    IN_JAVA_HOOK_CALLBACK.with(|flag| flag.get())
+}
 
 include!("registry.rs");
 include!("signature.rs");

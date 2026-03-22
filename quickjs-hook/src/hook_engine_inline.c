@@ -25,12 +25,6 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     entry->replacement = replacement;
 
-    /* stealth==2 只覆盖 4 字节 B 指令，trampoline 必须按相同 overwrite 长度回跳。
-     * 否则会在执行原函数时错误跳到 target+MIN_HOOK_SIZE，直接跳过前几条指令。 */
-    if (stealth == 2) {
-        entry->original_size = 4;
-    }
-
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -108,6 +102,23 @@ void emit_replace_epilogue(Arm64Writer* w) {
 
     /* Restore x18 (platform register) before returning to the original caller. */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X18, ARM64_REG_SP, 144);
+
+    /* Restore callee-saved registers x19-x29 from saved HookContext.
+     * Replace-mode callback (BLR) 遵循 AAPCS64 调用约定，回调内部的 Rust/C 代码
+     * 会自由使用 x19-x29 作为局部变量。如果不恢复，caller 的 callee-saved
+     * 寄存器会被破坏 → 延迟 SIGSEGV (如 GetOatQuickMethodHeader 的 caller
+     * 用 x25 做数据指针，回调破坏 x25 后 LDR [x25,#off] 崩溃)。 */
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X19, ARM64_REG_X20,
+                                             ARM64_REG_SP, 152, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22,
+                                             ARM64_REG_SP, 168, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24,
+                                             ARM64_REG_SP, 184, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26,
+                                             ARM64_REG_SP, 200, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28,
+                                             ARM64_REG_SP, 216, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_SP, 232);
 
     /* Restore x30 (LR — return to the caller of the hooked function) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X30, ARM64_REG_SP, 240);
@@ -236,27 +247,10 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    /* stealth==2 只 patch 4 字节 B 指令；先固定 overwrite 大小，再生成 trampoline。 */
-    if (stealth == 2) {
-        entry->original_size = 4;
-    }
-
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
-    }
-
-    /* stealth==2 (recomp) B 指令需要 ±128MB，预分配 thunk 到 entry 上，
-     * generate_attach_thunk 会复用已有的 entry->thunk。 */
-    if (stealth == 2 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
-        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, entry->target, (int64_t)1 << 27);
-        entry->thunk_alloc = THUNK_ALLOC_SIZE;
-        if (!entry->thunk) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return HOOK_ERROR_ALLOC_FAILED;
-        }
     }
 
     /* Generate thunk code */
@@ -347,26 +341,10 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     entry->on_enter = on_enter;
     entry->user_data = user_data;
 
-    /* stealth==2 只 patch 4 字节 B 指令；先固定 overwrite 大小，再生成 trampoline。 */
-    if (stealth == 2) {
-        entry->original_size = 4;
-    }
-
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
-    }
-
-    /* stealth==2 (recomp) B 指令需要 ±128MB，预分配 thunk */
-    if (stealth == 2 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
-        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, entry->target, (int64_t)1 << 27);
-        entry->thunk_alloc = THUNK_ALLOC_SIZE;
-        if (!entry->thunk) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
     }
 
     /* Generate replace thunk */

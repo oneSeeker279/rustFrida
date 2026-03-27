@@ -171,7 +171,10 @@ pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 重排 profile：解析当前二进制文件，过滤空属性，重建紧凑文件
+/// 验证 profile 完整性：统计属性数量，报告已删除的属性
+///
+/// 注意: 不再重建 trie，因为重建会改变 prop_info 在文件中的偏移，
+/// 而 zygote 子进程继承了基于原始偏移的缓存指针，remap 后指针失效导致崩溃。
 pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
     let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
 
@@ -182,9 +185,8 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
     let entries = std::fs::read_dir(&profile_dir)
         .map_err(|e| format!("读取 {} 失败: {}", profile_dir, e))?;
 
-    let mut total_before = 0usize;
-    let mut total_after = 0usize;
-    let mut files_repacked = 0u32;
+    let mut total_props = 0usize;
+    let mut deleted_props = 0usize;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
@@ -208,41 +210,20 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
             continue;
         }
 
-        // 解析所有属性
         let props = parse_prop_area(&data);
-        // 过滤空值（已删除的属性）
-        let active: Vec<_> = props.iter()
-            .filter(|(_, v)| !v.is_empty())
-            .cloned()
-            .collect();
-
-        if active.len() < props.len() || has_long_prop_holes(&data) {
-            let new_data = build_prop_area(&active);
-            total_before += data.len();
-            total_after += new_data.len();
-            std::fs::write(&path, &new_data)
-                .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
-            // 恢复 SELinux context
-            if let Some(ctx) = selinux_context_from_filename(&filename) {
-                let path_str = path.to_string_lossy();
-                set_selinux_context(&path_str, ctx);
+        for (name, value) in &props {
+            if value.is_empty() {
+                deleted_props += 1;
+                log_verbose!("已删除: {} (in {})", name, filename);
             }
-            files_repacked += 1;
-            log_verbose!(
-                "重排 {}: {} 条属性, {} → {} bytes",
-                filename, active.len(), data.len(), new_data.len()
-            );
         }
+        total_props += props.len();
     }
 
-    if files_repacked == 0 {
-        log_info!("无需重排（没有空洞）");
-    } else {
-        log_success!(
-            "已重排 {} 个文件 ({} → {} bytes)",
-            files_repacked, total_before, total_after
-        );
-    }
+    log_success!(
+        "Profile '{}': {} 条属性, {} 条已删除",
+        profile_name, total_props, deleted_props
+    );
     Ok(())
 }
 
@@ -274,7 +255,7 @@ pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
 /// 向 profile 中添加新属性（当属性不存在时）
 ///
 /// 策略: 扫描所有 prop_area 文件，按前缀匹配度选择最合适的文件，
-/// 解析已有属性 → 追加新属性 → 重建 prop_area。
+/// 在原始二进制上原地插入 trie 节点 + prop_info（保留已有偏移不变）。
 fn add_prop_to_profile(
     profile_dir: &str,
     key: &str,
@@ -285,9 +266,9 @@ fn add_prop_to_profile(
 
     let key_parts: Vec<&str> = key.split('.').collect();
 
-    // 候选文件: (路径, 已有属性, 前缀匹配段数)
+    // 候选文件: (路径, 属性数, 前缀匹配段数)
     let mut best_path: Option<String> = None;
-    let mut best_props: Vec<(String, String)> = Vec::new();
+    let mut best_count: usize = 0;
     let mut best_score: usize = 0;
 
     for entry in entries {
@@ -333,17 +314,16 @@ fn add_prop_to_profile(
             }
         }
 
-        // 选前缀匹配最高的；同分选属性最多的（通常是 default_prop）
         let better = match &best_path {
             None => true,
             Some(_) => {
                 file_score > best_score
-                    || (file_score == best_score && props.len() > best_props.len())
+                    || (file_score == best_score && props.len() > best_count)
             }
         };
         if better {
             best_path = Some(path.to_string_lossy().to_string());
-            best_props = props;
+            best_count = props.len();
             best_score = file_score;
         }
     }
@@ -352,13 +332,15 @@ fn add_prop_to_profile(
         "Profile 中没有可用的属性区域文件".to_string()
     })?;
 
-    // 追加新属性并重建
-    best_props.push((key.to_string(), value.to_string()));
-    let new_data = build_prop_area(&best_props);
-    std::fs::write(&target_path, &new_data)
+    // 在原始文件上原地插入新属性（保留 trie 布局）
+    let mut data = std::fs::read(&target_path)
+        .map_err(|e| format!("读取 {} 失败: {}", target_path, e))?;
+
+    insert_prop_inplace(&mut data, key, value)?;
+
+    std::fs::write(&target_path, &data)
         .map_err(|e| format!("写回 {} 失败: {}", target_path, e))?;
 
-    // 恢复 SELinux context
     let filename = std::path::Path::new(&target_path)
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -370,9 +352,111 @@ fn add_prop_to_profile(
         "添加新属性 [{}] 到 {} (共 {} 条属性)",
         key,
         filename,
-        best_props.len()
+        best_count + 1
     );
 
+    Ok(())
+}
+
+/// 在 prop_area 原始二进制数据上原地插入新属性
+///
+/// 从 header.bytes_used 处接着分配 trie 节点和 prop_info，
+/// 沿着已有 trie 路径找到插入点，不改变任何已有节点的偏移。
+fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(), String> {
+    let data_start = PROP_AREA_HEADER_SIZE;
+    let data_cap = data.len() - data_start;
+
+    // 读取当前 bump 位置
+    let mut alloc_pos =
+        u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+
+    // bump 分配器（4 字节对齐）
+    let mut bump = |size: usize| -> Result<usize, String> {
+        let aligned = (alloc_pos + 3) & !3;
+        if aligned + size > data_cap {
+            return Err("prop_area 空间不足".to_string());
+        }
+        alloc_pos = aligned + size;
+        Ok(aligned)
+    };
+
+    let read_u32 =
+        |data: &[u8], off: usize| u32::from_le_bytes(data[data_start + off..data_start + off + 4].try_into().unwrap());
+
+    let write_u32 = |data: &mut [u8], off: usize, val: u32| {
+        data[data_start + off..data_start + off + 4].copy_from_slice(&val.to_le_bytes());
+    };
+
+    let parts: Vec<&str> = key.split('.').collect();
+    // 从根节点的 children 指针开始
+    let mut cur_ptr_off: usize = 16; // root.children 在 offset 16
+
+    for (depth, part) in parts.iter().enumerate() {
+        let is_leaf = depth == parts.len() - 1;
+
+        loop {
+            let cur = read_u32(data, cur_ptr_off);
+            if cur == 0 {
+                // 空位 → 创建新 trie 节点
+                let namelen = part.len();
+                let node_off = bump(20 + namelen)?;
+                write_u32(data, node_off, namelen as u32); // namelen
+                data[data_start + node_off + 20..data_start + node_off + 20 + namelen]
+                    .copy_from_slice(part.as_bytes());
+                // 写入指针
+                write_u32(data, cur_ptr_off, node_off as u32);
+
+                if is_leaf {
+                    // 分配 prop_info: serial(4) + value(92) + name\0
+                    let full_name = key.as_bytes();
+                    let pi_off = bump(4 + PROP_VALUE_MAX + full_name.len() + 1)?;
+                    write_u32(data, pi_off, 2); // serial = 2
+                    let vb = value.as_bytes();
+                    let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                    data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
+                        .copy_from_slice(&vb[..vlen]);
+                    let noff = pi_off + 4 + PROP_VALUE_MAX;
+                    data[data_start + noff..data_start + noff + full_name.len()]
+                        .copy_from_slice(full_name);
+                    // prop 指针
+                    write_u32(data, node_off + 4, pi_off as u32);
+                }
+                cur_ptr_off = node_off + 16; // children
+                break;
+            } else {
+                // 节点已存在 → 比较
+                let cur_off = cur as usize;
+                let nl = read_u32(data, cur_off) as usize;
+                let cur_name = &data[data_start + cur_off + 20..data_start + cur_off + 20 + nl];
+
+                match part.as_bytes().cmp(cur_name) {
+                    std::cmp::Ordering::Less => cur_ptr_off = cur_off + 8,    // left
+                    std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
+                    std::cmp::Ordering::Equal => {
+                        if is_leaf {
+                            // 叶节点已存在 → 分配新 prop_info 并更新指针
+                            let full_name = key.as_bytes();
+                            let pi_off = bump(4 + PROP_VALUE_MAX + full_name.len() + 1)?;
+                            write_u32(data, pi_off, 2);
+                            let vb = value.as_bytes();
+                            let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                            data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
+                                .copy_from_slice(&vb[..vlen]);
+                            let noff = pi_off + 4 + PROP_VALUE_MAX;
+                            data[data_start + noff..data_start + noff + full_name.len()]
+                                .copy_from_slice(full_name);
+                            write_u32(data, cur_off + 4, pi_off as u32);
+                        }
+                        cur_ptr_off = cur_off + 16; // children
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 更新 bytes_used
+    data[0..4].copy_from_slice(&(alloc_pos as u32).to_le_bytes());
     Ok(())
 }
 
